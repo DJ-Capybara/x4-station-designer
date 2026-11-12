@@ -1,0 +1,2537 @@
+// Builder UI: palette, 3D view, inspector. All edits go to the Rust core
+// through the Tauri commands in api.ts, which return the new scene.
+import "./style.css";
+import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { ask, open, save } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import type { BufferGeometry } from "three";
+import { api, type Blueprints, type Entry, type EquipmentGroup, type EquipmentItem, type Issue, type ModuleInfo, type PlannedModule, type PlanRef, type PlotStatus, type PlanArgs, type ProductionPlan, type Quality, type Quat, type Scene, type Sector, type Shape, type SnapInfo, type TargetRate, type Vec3 } from "./api";
+import { attachMatrix, CLASS_COLORS, type DiffuseTexture, modelGeometry, poseMatrix, View3D } from "./view3d";
+
+const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
+
+const view = new View3D($("viewport"));
+const shapes = new Map<string, Shape>();
+/** Real models per macro at the current quality (null: none, boxes are drawn). */
+const models = new Map<string, BufferGeometry | null>();
+/** Diffuse textures per game material (null: none or unsupported). */
+const textures = new Map<string, DiffuseTexture | null>();
+// On by default: measured at about 0.2 s and 10 MB for an 84- or 332-module station,
+// with no frame-rate cost (models are instanced). The toggle turns them off.
+let showTextures = (() => {
+  try {
+    return localStorage.getItem("x4sd.textures") !== "off";
+  } catch {
+    return true;
+  }
+})();
+let quality: Quality = (() => {
+  try {
+    return (localStorage.getItem("x4sd.quality") as Quality | null) ?? "normal";
+  } catch {
+    return "normal";
+  }
+})();
+let modules: ModuleInfo[] = [];
+let scene: Scene | null = null;
+/** The player profile folder (from the catalog), for the plan file dialogs. */
+let profileDir: string | null = null;
+let selected: number | null = null;
+/** Build-order rows selected together, and the row Shift-click extends from. */
+let orderSelection = new Set<number>();
+let orderAnchor: number | null = null;
+let armed: ModuleInfo | null = null;
+/** Module being moved onto another snap (with everything attached to it), if any. */
+let moving: number | null = null;
+/** Copy sequence: `moving` is copied (with everything attached to it) instead of moved, onto each snap clicked. */
+let copying = false;
+/** While placing or moving: the free snap under the cursor, previewed there. */
+let hoverTarget: { index: number; snap: string } | null = null;
+/** Build-order preview: show modules up to this step (null: all). */
+let buildStep: number | null = null;
+/** Races shown in the palette; empty means all. Modules without a race count as "generic". */
+const races = new Set<string>(
+  (() => {
+    try {
+      return JSON.parse(localStorage.getItem("x4sd.races") ?? "[]") as string[];
+    } catch {
+      return [];
+    }
+  })(),
+);
+const raceOf = (m: ModuleInfo) => m.race ?? "generic";
+/** The player's blueprints from a save, remembered (D-16). Off by default: every module. */
+let blueprints: Blueprints = (() => {
+  try {
+    return (JSON.parse(localStorage.getItem("x4sd.blueprints") ?? "null") as Blueprints | null) ?? { on: false, save: null, read_at: null, modules: [] };
+  } catch {
+    return { on: false, save: null, read_at: null, modules: [] };
+  }
+})();
+const ownedSet = () => (blueprints.on && blueprints.save ? new Set(blueprints.modules.map((m) => m.toLowerCase())) : null);
+let owned = ownedSet();
+/** The modules on offer: those with a blueprint while the limit is on, else all. */
+const offered = () => (owned ? modules.filter((m) => owned!.has(m.macro.toLowerCase())) : modules);
+
+/** The game's build-menu categories, in its order (`leftBar` in menu_station_configuration.lua),
+ * with the macro classes each one holds (radar is filed under Other by the menu). */
+const CATEGORIES = [
+  { name: "Production Modules", classes: ["production"] },
+  { name: "Build Modules", classes: ["buildmodule"] },
+  { name: "Storage Modules", classes: ["storage"] },
+  { name: "Habitation Modules", classes: ["habitation"] },
+  { name: "Welfare Modules", classes: ["welfaremodule"] },
+  { name: "Dock Modules", classes: ["dockarea", "pier"] },
+  { name: "Defence Modules", classes: ["defencemodule"] },
+  { name: "Processing Modules", classes: ["processingmodule"] },
+  { name: "Other Modules", classes: ["connectionmodule", "radar"] },
+  { name: "Venture Modules", classes: ["ventureplatform"] },
+];
+/** Position of a module's category in the game's order (unknown classes last). */
+const categoryOf = (m: ModuleInfo) => {
+  const i = CATEGORIES.findIndex((c) => c.classes.includes(m.class));
+  return i < 0 ? CATEGORIES.length : i;
+};
+
+// ---------------------------------------------------------------- helpers
+
+function status(text: string, kind: "" | "error" | "good" = "") {
+  const el = $("status");
+  el.textContent = text;
+  el.className = kind;
+}
+
+async function shapeOf(macro: string): Promise<Shape> {
+  const key = macro.toLowerCase();
+  let shape = shapes.get(key);
+  if (!shape) {
+    shape = await api.moduleShape(macro);
+    shapes.set(key, shape);
+  }
+  return shape;
+}
+
+async function modelOf(macro: string) {
+  const key = macro.toLowerCase();
+  if (models.has(key)) return;
+  try {
+    models.set(key, modelGeometry(await api.moduleModel(macro, quality)));
+  } catch {
+    models.set(key, null);
+  }
+}
+
+/** Loads the diffuse textures of every material the scene's models use. */
+async function loadTextures() {
+  const names = new Set<string>();
+  for (const e of scene?.entries ?? []) {
+    for (const n of models.get(e.macro.toLowerCase())?.userData.materials ?? []) names.add(n.toLowerCase());
+  }
+  const missing = [...names].filter((n) => !textures.has(n));
+  if (missing.length === 0) return;
+  const started = performance.now();
+  status(`Loading ${missing.length} textures…`);
+  await Promise.all(
+    missing.map(async (n) => {
+      try {
+        const maps = await api.materialMaps(n);
+        textures.set(n, maps.diffuse ? view.diffuseTexture(await api.texture(maps.diffuse)) : null);
+      } catch {
+        textures.set(n, null);
+      }
+    }),
+  );
+  const loaded = [...textures.values()].filter((t) => t);
+  const mb = loaded.reduce((sum, t) => sum + (t?.bytes ?? 0), 0) / 1048576;
+  status(`Textures: ${loaded.length} loaded (${mb.toFixed(1)} MB GPU memory) in ${((performance.now() - started) / 1000).toFixed(1)} s`, "good");
+}
+
+/** Runs a command that returns the new scene, then redraws. Errors go to the status bar. */
+async function apply(action: Promise<Scene>, done?: string, frame = false, userEdit = false): Promise<boolean> {
+  try {
+    const fitted = scene?.plot?.fits ?? true;
+    scene = await action;
+    const macros = [...new Set(scene.entries.map((e) => e.macro))];
+    if (macros.some((x) => !models.has(x.toLowerCase()))) status("Loading models…");
+    await Promise.all(macros.flatMap((x) => [shapeOf(x), modelOf(x)]));
+    if (showTextures) await loadTextures();
+    if (scene.focus) selected = scene.focus;
+    if (selected !== null && !scene.entries.some((e) => e.index === selected)) selected = null;
+    // The old indices were renumbered. A drag that moved several rows puts the range back afterwards.
+    orderAnchor = selected;
+    orderSelection = new Set(selected === null ? [] : [selected]);
+    redraw();
+    if (frame) view.frame();
+    if (done) status(done, "good");
+    if (userEdit && fitted && scene.plot && !scene.plot.fits) await offerBiggerPlot(scene.plot);
+    return true;
+  } catch (e) {
+    status(String(e), "error");
+    return false;
+  }
+}
+
+/** The Checks list and the plot summary (also live while a gizmo drag is in progress). */
+function renderChecks(list: Issue[], p: PlotStatus | null) {
+  // Notes (not problems) come after the issues and don't count.
+  const problems = list.filter((i) => !i.note).length;
+  list = [...list.filter((i) => !i.note), ...list.filter((i) => i.note)];
+  const issueCount = $("issue-count");
+  issueCount.textContent = problems ? `(${problems})` : "";
+  issueCount.className = problems ? "bad" : "";
+  const issues = $("issues");
+  issues.replaceChildren();
+  if (problems === 0) {
+    const li = document.createElement("li");
+    li.className = "ok";
+    li.textContent = scene?.entries.length ? "No problems found" : "Empty design";
+    issues.append(li);
+  }
+  for (const issue of list) {
+    const li = document.createElement("li");
+    li.textContent = issue.text;
+    if (issue.note) {
+      li.className = "note";
+      li.title = "Not a problem: the game lets modules overlap, except docks, piers and fabrication bays";
+    }
+    // Double click zooms to 1 km from the module. No dblclick event: the first click redraws the list.
+    const index = issue.index;
+    if (index !== null)
+      li.onclick = (ev) => {
+        select(index);
+        if (ev.detail === 2) view.frameModule(index, 1000);
+      };
+    issues.append(li);
+  }
+  const summary = $("plot-summary");
+  summary.textContent = p?.plot
+    ? `Plot ${p.plot.size.join("×")} km · station needs ${p.required ? p.required.size.join("×") + " km" : "nothing yet"}` + (p.possible ? "" : " (more than any plot)")
+    : "No plot";
+  summary.className = "details" + (p && !p.fits ? " bad" : "");
+}
+
+// Live checks while the gizmo is dragged: one request at a time, the latest position wins.
+let previewWant: { index: number; position: Vec3; rotation: Quat } | null = null;
+let previewSent = "";
+let previewBusy = false;
+async function previewGizmo() {
+  if (previewBusy) return;
+  previewBusy = true;
+  while (previewWant) {
+    const want = previewWant;
+    previewWant = null;
+    try {
+      const r = await api.previewGizmo(want.index, want.position, want.rotation);
+      // A late answer after the drag ended would hide the real checks.
+      if (view.gizmoDragging()) {
+        renderChecks(r.issues, r.plot);
+        view.setPlotFits(r.plot?.fits ?? true);
+      }
+    } catch {
+      // The last checks shown stay; the real ones come when the drag ends.
+    }
+  }
+  previewBusy = false;
+}
+view.onGizmoDrag = (position, rotation) => {
+  const key = JSON.stringify([selected, position, rotation]);
+  if (selected === null || key === previewSent) return;
+  previewSent = key;
+  previewWant = { index: selected, position, rotation };
+  void previewGizmo();
+};
+
+/** The last edit pushed the station outside its plot: offer to enlarge it (or undo). */
+async function offerBiggerPlot(p: NonNullable<Scene["plot"]>) {
+  const need = p.required?.text ?? "?";
+  if (!p.possible) {
+    if (await ask(`The station no longer fits any plot: it needs ${need}, and plots are at most 20 km per axis.\n\nUndo the last change?`, { title: "Plot", kind: "warning" })) {
+      await apply(api.undo(), "Undone: the station has to fit a 20 km plot");
+    }
+    return;
+  }
+  if (await ask(`The station no longer fits the plot (${p.plot?.text}).\nIt needs ${need}.\n\nEnlarge the plot?`, { title: "Plot", kind: "warning" })) {
+    await apply(api.fitPlot(true), "Plot enlarged");
+  }
+}
+
+function entry(index: number | null) {
+  return scene?.entries.find((e) => e.index === index) ?? null;
+}
+
+function moduleName(macro: string) {
+  return modules.find((m) => m.macro.toLowerCase() === macro.toLowerCase())?.name ?? macro;
+}
+
+// ---------------------------------------------------------------- drawing
+
+function redraw() {
+  if (!scene) return;
+  if (buildStep !== null && buildStep >= scene.entries.length) buildStep = null;
+  // A copy may go onto the copied modules, but not onto the source's own snaps (picked to connect by).
+  const noSnaps = moving === null ? null : copying ? new Set([moving]) : subtree(moving);
+  view.render(scene, shapes, models, showTextures ? textures : null, selected, armed !== null || moving !== null, buildStep, noSnaps);
+  hoverTarget = null; // the cones were redrawn
+  refreshPlacing();
+  renderOrder();
+  void refreshCost();
+  void refreshAnalysis();
+  void refreshLoad();
+  void refreshEquipment();
+  renderEquipmentSummary();
+  renderPlanner();
+  $("dirty").hidden = !scene.dirty;
+  const title = `X4 Station Designer - ${scene.name}${scene.dirty ? " *" : ""}`;
+  if (title !== windowTitle) {
+    windowTitle = title;
+    void getCurrentWindow().setTitle(title).catch(() => undefined);
+  }
+  // The selected module's gizmo: a free-standing one moves or rotates; an attached
+  // one rotates about its joint (where its snap meets the other's), staying attached.
+  const root = entry(selected);
+  const editable = root && !armed && moving === null && buildStep === null;
+  // On the module itself, as in the game (an attached one still turns about its joint).
+  const gizmoAt = !editable ? null : !root.attached || gizmoMode === "rotate" ? root.position : null;
+  view.setGizmo(
+    gizmoAt ? { position: gizmoAt, rotation: root!.rotation, joint: root!.attached?.joint ?? null, carries: subtree(root!.index) } : null,
+    root
+      ? (p, q) => {
+          const name = root.name ?? root.macro;
+          if (root.attached) void apply(api.rotateAttached(root.index, q), `Turned ${name} about its joint`, false, true);
+          else void apply(api.moveRoot(root.index, p, q), `${gizmoMode === "rotate" ? "Rotated" : "Moved"} ${name}`, false, true);
+        }
+      : null,
+    root?.attached ? "rotate" : gizmoMode,
+  );
+  // The button stays while placing: it drops the placement (see its onclick).
+  $("gizmo-row").hidden = !(root && moving === null && buildStep === null);
+  $("btn-gizmo-mode").textContent = !gizmoAt || (gizmoMode !== "rotate" && !root?.attached) ? "Rotate gizmo" : root?.attached ? "Hide gizmo" : "Move gizmo";
+  $("btn-straighten").hidden = !(root?.attached && (root.attached.tilt ?? 0) > 0.05);
+  $("btn-twist-left").textContent = `⟲ ${rotationStep}°`;
+  $("btn-twist-right").textContent = `⟳ ${rotationStep}°`;
+  $<HTMLInputElement>("design-name").value = scene.name;
+  const count = `${scene.entries.length} module${scene.entries.length === 1 ? "" : "s"}`;
+  $("patches").textContent = scene.patches.length ? `${count} · Needs: ${scene.patches.join(", ")}` : count;
+  $<HTMLButtonElement>("btn-undo").disabled = !scene.can_undo;
+  $<HTMLButtonElement>("btn-redo").disabled = !scene.can_redo;
+
+  renderChecks(scene.issues, scene.plot);
+
+  const sel = entry(selected);
+  $("selection-panel").hidden = !sel;
+  if (sel) {
+    $("sel-name").textContent = sel.name ?? sel.macro;
+    const a = sel.attached;
+    $("sel-details").textContent =
+      `#${sel.index} · ${sel.macro}\n` +
+      (a ? `attached to #${a.to} (${a.to_snap}) by ${a.snap}, twist ${a.twist ?? "?"}°${a.tilt ? `, tilted ${a.tilt}°` : ""}` : sel.index === scene.entries[0]?.index ? "not attached (root)" : "not attached: it floats (Move… re-attaches it)") +
+      `\n${sel.free_snaps.length} free snap(s)`;
+    $<HTMLButtonElement>("btn-twist-left").disabled = !a;
+    $<HTMLButtonElement>("btn-twist-right").disabled = !a;
+    $<HTMLButtonElement>("btn-detach").disabled = !a;
+    $("sel-snap-row").hidden = !a;
+    $("sel-position").hidden = !!a;
+    document.querySelectorAll<HTMLInputElement>("#sel-position input").forEach((input) => {
+      if (document.activeElement !== input) input.value = String(Math.round(sel.position[Number(input.dataset.axis)] * 100) / 100);
+    });
+    if (a) {
+      $<HTMLSelectElement>("sel-snap").replaceChildren(...connectableSnaps(sel).map(snapOption));
+      $<HTMLSelectElement>("sel-snap").value = a.snap;
+    }
+    $<HTMLButtonElement>("btn-move").disabled = (scene.entries.length ?? 0) < 2;
+    $<HTMLInputElement>("stage-end").checked = sel.stage_end;
+  }
+  $("btn-place-root").hidden = scene.entries.length > 0;
+
+  const p = scene.plot;
+  document.querySelectorAll<HTMLInputElement>(".plot-grid input").forEach((input) => {
+    const side = input.dataset.side as "pos" | "neg";
+    if (document.activeElement !== input) input.value = String(p?.plot?.[side][Number(input.dataset.axis)] ?? "");
+  });
+}
+
+/** Sends the six plot fields; the core rejects axes outside 1..20 km. */
+function plotFromInputs(): Promise<Scene> {
+  const pos = [0, 0, 0] as [number, number, number];
+  const neg = [0, 0, 0] as [number, number, number];
+  document.querySelectorAll<HTMLInputElement>(".plot-grid input").forEach((input) => {
+    const target = input.dataset.side === "pos" ? pos : neg;
+    target[Number(input.dataset.axis)] = Math.max(0, Math.round(Number(input.value) || 0));
+  });
+  return api.setPlot(pos, neg);
+}
+
+function renderPalette() {
+  const text = $<HTMLInputElement>("search").value.toLowerCase();
+  const category = $<HTMLSelectElement>("class-filter").value;
+  const all = offered();
+  const shown = all.filter(
+    (m) =>
+      (!category || categoryOf(m) === Number(category)) &&
+      (races.size === 0 || races.has(raceOf(m))) &&
+      (!text || m.name.toLowerCase().includes(text) || m.macro.toLowerCase().includes(text)),
+  );
+  const list = $("module-list");
+  list.replaceChildren(
+    ...shown.map((m) => {
+      const div = document.createElement("div");
+      div.className = "module" + (armed?.macro === m.macro ? " armed" : "");
+      div.draggable = true;
+      const color = (CLASS_COLORS[m.class] ?? 0xffffff).toString(16).padStart(6, "0");
+      div.innerHTML = `<div class="n"><span class="swatch" style="background:#${color}"></span></div><div class="m"></div>`;
+      div.querySelector(".n")!.append(m.name);
+      div.querySelector(".m")!.textContent = `${m.macro} · ${m.class}${m.source ? " · " + m.source : ""}`;
+      div.onclick = () => arm(armed?.macro === m.macro ? null : m);
+      div.ondragstart = (ev) => {
+        ev.dataTransfer!.setData("text/x4sd-macro", m.macro);
+        void arm(m);
+      };
+      return div;
+    }),
+  );
+  $("module-count").textContent = `${shown.length} of ${all.length} modules${owned ? " with blueprints" : ""}`;
+}
+
+/** Build order rows matching the search box: every typed word is in the name or macro. Empty: none. */
+function orderMatches(): number[] {
+  const words = $<HTMLInputElement>("order-search").value.toLowerCase().split(/\s+/).filter(Boolean);
+  if (!scene || !words.length) return [];
+  return scene.entries
+    .filter((e) => {
+      const text = `${e.name ?? ""} ${e.macro}`.toLowerCase();
+      return words.every((w) => text.includes(w));
+    })
+    .map((e) => e.index);
+}
+
+/** Selects the next (or previous) build order match after the selected module, scrolls to it and frames it in the view. */
+function jumpToMatch(direction: 1 | -1) {
+  const matches = orderMatches();
+  if (!matches.length) return;
+  const after = direction === 1 ? matches.find((i) => i > (selected ?? 0)) : [...matches].reverse().find((i) => i < (selected ?? Infinity));
+  const index = after ?? (direction === 1 ? matches[0] : matches[matches.length - 1]);
+  select(index);
+  view.frameModule(index);
+  $("order-list").querySelector(".order-row.selected")?.scrollIntoView({ block: "nearest" });
+}
+
+/** Selects every build-order row from the Shift anchor through `index`. The anchor stays put. */
+function extendOrderSelection(index: number): boolean {
+  if (!scene || orderAnchor === null) return false;
+  const from = scene.entries.findIndex((x) => x.index === orderAnchor);
+  const to = scene.entries.findIndex((x) => x.index === index);
+  if (from < 0 || to < 0) return false;
+  const lo = Math.min(from, to);
+  const hi = Math.max(from, to);
+  orderSelection = new Set(scene.entries.slice(lo, hi + 1).map((x) => x.index));
+  selected = index;
+  return true;
+}
+
+/** Build-order drag in progress. Pointer events, not HTML5 drag: a native drag
+ * in this window swallows the mouse wheel and leaves it stuck afterwards. */
+type OrderDrag = {
+  pointerId: number;
+  anchor: number;
+  indices: number[];
+  startX: number;
+  startY: number;
+  x: number;
+  y: number;
+  moved: boolean;
+};
+let orderDrag: OrderDrag | null = null;
+/** The click that follows a completed drag must not collapse the selection. */
+let suppressOrderClick = false;
+const ORDER_DRAG_SLOP = 4;
+
+function clearOrderDrop() {
+  for (const row of document.querySelectorAll("#order-list .order-row.drop")) row.classList.remove("drop");
+}
+
+/** The build-order row under the pointer, including a release on the gap between rows. */
+function orderRowAt(x: number, y: number): HTMLElement | null {
+  const list = $("order-list");
+  const box = list.getBoundingClientRect();
+  if (x < box.left || x > box.right || y < box.top || y > box.bottom) return null;
+  const hit = document.elementFromPoint(x, y)?.closest(".order-row");
+  if (hit instanceof HTMLElement && list.contains(hit)) return hit;
+  let best: HTMLElement | null = null;
+  let bestDist = Infinity;
+  for (const row of list.querySelectorAll<HTMLElement>(".order-row")) {
+    const r = row.getBoundingClientRect();
+    if (y < r.top - 12 || y > r.bottom + 12) continue;
+    const dist = Math.abs(y - (r.top + r.bottom) / 2);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = row;
+    }
+  }
+  return best;
+}
+
+function markOrderDrop(x: number, y: number) {
+  clearOrderDrop();
+  if (!orderDrag) return;
+  const row = orderRowAt(x, y);
+  const index = Number(row?.dataset.index);
+  if (!row || !(index > 0) || orderDrag.indices.includes(index)) return;
+  row.classList.add("drop");
+}
+
+/** Puts the grabbed rows at `position` (the drop row's current step). The core
+ * stops at the closest step the attachment order allows. */
+function commitOrderDrop(indices: number[], anchor: number, position: number) {
+  if (!scene || indices.includes(position)) return;
+  const count = indices.length;
+  const history = scene.history;
+  const kept = new Set(orderSelection);
+  const keptAnchor = orderAnchor;
+  void (async () => {
+    const ok = await apply(api.moveBlockInBuildOrder(indices, anchor, position));
+    const next = scene;
+    if (!ok || !next || next.focus == null) return;
+    if (next.history === history) {
+      orderSelection = kept;
+      orderAnchor = keptAnchor;
+      renderOrder();
+      const first = indices[0];
+      const last = indices[indices.length - 1];
+      status(count > 1 ? `Left ${count} modules at steps ${first}-${last}` : `Left #${anchor} at step ${anchor}`);
+      return;
+    }
+    if (count > 1) {
+      const start = next.focus - indices.indexOf(anchor);
+      orderAnchor = next.focus;
+      orderSelection = new Set(Array.from({ length: count }, (_, i) => start + i));
+      renderOrder();
+      status(`Moved ${count} modules to steps ${start}-${start + count - 1}`, "good");
+    } else {
+      status(`Moved #${anchor} to step ${next.focus}`, "good");
+    }
+  })();
+}
+
+function endOrderDrag(ev: PointerEvent, commit: boolean) {
+  const drag = orderDrag;
+  if (!drag || ev.pointerId !== drag.pointerId) return;
+  orderDrag = null;
+  const list = $("order-list");
+  list.classList.remove("dragging");
+  try {
+    if (list.hasPointerCapture(ev.pointerId)) list.releasePointerCapture(ev.pointerId);
+  } catch {
+    // The pointer is already gone.
+  }
+  clearOrderDrop();
+  if (!drag.moved) return;
+  suppressOrderClick = true;
+  setTimeout(() => {
+    suppressOrderClick = false;
+  }, 0);
+  if (!commit) return;
+  const position = Number(orderRowAt(ev.clientX, ev.clientY)?.dataset.index);
+  if (!(position > 0)) return;
+  commitOrderDrop(drag.indices, drag.anchor, position);
+}
+
+$("order-list").addEventListener(
+  "click",
+  (ev) => {
+    if (!suppressOrderClick) return;
+    suppressOrderClick = false;
+    ev.preventDefault();
+    ev.stopPropagation();
+  },
+  true,
+);
+$("order-list").addEventListener(
+  "wheel",
+  (ev) => {
+    const drag = orderDrag;
+    if (!drag?.moved) return;
+    const list = $("order-list");
+    const line = ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? list.clientHeight : 1;
+    list.scrollTop += ev.deltaY * line;
+    ev.preventDefault();
+    markOrderDrop(drag.x, drag.y);
+  },
+  { passive: false },
+);
+window.addEventListener("pointermove", (ev) => {
+  const drag = orderDrag;
+  if (!drag || ev.pointerId !== drag.pointerId) return;
+  drag.x = ev.clientX;
+  drag.y = ev.clientY;
+  if (!drag.moved) {
+    if (Math.hypot(ev.clientX - drag.startX, ev.clientY - drag.startY) < ORDER_DRAG_SLOP) return;
+    drag.moved = true;
+    const list = $("order-list");
+    list.classList.add("dragging");
+    try {
+      list.setPointerCapture(ev.pointerId);
+    } catch {
+      // The gesture still tracks pointermove on the window.
+    }
+  }
+  markOrderDrop(ev.clientX, ev.clientY);
+});
+window.addEventListener("pointerup", (ev) => endOrderDrag(ev, true));
+window.addEventListener("pointercancel", (ev) => endOrderDrag(ev, false));
+
+/** The build order list: one row per module in build order, stage dividers, drag to reorder. */
+function renderOrder() {
+  if (!scene) return;
+  const matches = new Set(orderMatches());
+  const searching = $<HTMLInputElement>("order-search").value.trim() !== "";
+  const at = selected !== null && matches.has(selected) ? [...matches].indexOf(selected) + 1 : 0;
+  $("order-search-count").textContent = !searching ? "" : !matches.size ? "no match" : at ? `${at} of ${matches.size}` : `${matches.size} found`;
+  const total = scene.entries.length;
+  const slider = $<HTMLInputElement>("build-step");
+  slider.max = String(total);
+  slider.value = String(buildStep ?? total);
+  $("build-step-label").textContent = `${buildStep ?? total} / ${total}`;
+  const rows: HTMLElement[] = [];
+  let stage = 1;
+  for (const e of scene.entries) {
+    const row = document.createElement("div");
+    row.className =
+      "order-row" +
+      (e.index === selected || orderSelection.has(e.index) ? " selected" : "") +
+      (buildStep !== null && e.index > buildStep ? " later" : "") +
+      (matches.has(e.index) ? " match" : "");
+    row.dataset.index = String(e.index);
+    row.innerHTML = `<span class="num"></span><span class="n"></span>`;
+    row.querySelector(".num")!.textContent = `${e.index}.`;
+    row.querySelector(".n")!.textContent = e.name ?? e.macro;
+    row.title = e.attached ? `attaches to #${e.attached.to}` : "not attached (root)";
+    // Double click zooms to the module. No dblclick event: the first click redraws the rows.
+    row.onclick = (ev) => {
+      if (ev.shiftKey && extendOrderSelection(e.index)) {
+        redraw();
+        if (ev.detail === 2) view.frameModule(e.index);
+        return;
+      }
+      select(e.index);
+      if (ev.detail === 2) view.frameModule(e.index);
+    };
+    row.onpointerdown = (ev) => {
+      if (ev.button !== 0 || !scene) return;
+      clearOrderDrop();
+      const group = orderSelection.has(e.index) ? orderSelection : new Set([e.index]);
+      const indices = scene.entries.map((x) => x.index).filter((i) => group.has(i));
+      orderDrag = {
+        pointerId: ev.pointerId,
+        anchor: e.index,
+        indices,
+        startX: ev.clientX,
+        startY: ev.clientY,
+        x: ev.clientX,
+        y: ev.clientY,
+        moved: false,
+      };
+    };
+    rows.push(row);
+    if (e.stage_end) {
+      const divider = document.createElement("div");
+      divider.className = "stage-divider";
+      divider.textContent = `End of stage ${stage++}`;
+      rows.push(divider);
+    }
+  }
+  $("order-list").replaceChildren(...rows);
+}
+
+function renderRaceFilter() {
+  const counts = new Map<string, number>();
+  offered().forEach((m) => counts.set(raceOf(m), (counts.get(raceOf(m)) ?? 0) + 1));
+  const chip = (label: string, on: boolean, title: string, click: () => void) => {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.title = title;
+    b.className = on ? "on" : "";
+    b.onclick = click;
+    return b;
+  };
+  const toggle = (race: string | null) => {
+    if (race === null) races.clear();
+    else if (!races.delete(race)) races.add(race);
+    try {
+      localStorage.setItem("x4sd.races", JSON.stringify([...races]));
+    } catch {
+      // Remembering the choice is a convenience only.
+    }
+    renderRaceFilter();
+    renderPalette();
+  };
+  $("race-filter").replaceChildren(
+    chip("All", races.size === 0, "Show every race", () => toggle(null)),
+    ...[...counts.keys()].sort().map((r) =>
+      chip(r[0].toUpperCase() + r.slice(1), races.has(r), `${counts.get(r)} ${r} modules; click to add or remove`, () => toggle(r)),
+    ),
+  );
+}
+
+let windowTitle = "";
+
+/** Build method for costs (the game's Preferred Build Method), remembered. */
+let buildMethod = (() => {
+  try {
+    return localStorage.getItem("x4sd.method") ?? "default";
+  } catch {
+    return "default";
+  }
+})();
+let costRequest = 0;
+
+/** Right pane: what the selected module (with its equipment) or the whole station needs. */
+async function refreshCost() {
+  if (!scene) return;
+  const request = ++costRequest;
+  const sel = entry(selected);
+  let cost;
+  try {
+    cost = await api.buildCost(sel?.index ?? null, buildMethod);
+  } catch (e) {
+    $("cost-total").textContent = String(e);
+    return;
+  }
+  if (request !== costRequest) return; // a newer request is on its way
+  $("cost-title").textContent = sel ? `Build cost: ${sel.name ?? sel.macro}` : "Build cost: whole station";
+  const methodSelect = $<HTMLSelectElement>("build-method");
+  if (methodSelect.options.length !== cost.methods.length) {
+    methodSelect.replaceChildren(...cost.methods.map((m) => new Option(m.name, m.id)));
+  }
+  methodSelect.value = buildMethod;
+  const n = (x: number) => Math.round(x).toLocaleString("en-US");
+  $("cost-lines").replaceChildren(
+    ...cost.lines.map((l) => {
+      const row = document.createElement("tr");
+      row.innerHTML = `<td></td><td class="n"></td><td class="v"></td>`;
+      row.children[0].textContent = l.name;
+      row.children[1].textContent = n(l.amount);
+      row.children[2].textContent = l.value === null ? "" : `${n(l.value)} Cr`;
+      return row;
+    }),
+  );
+  $("cost-total").textContent = scene.entries.length
+    ? `≈ ${n(cost.value)} Cr at average prices` + (cost.unknown.length ? ` (no recipe: ${cost.unknown.join(", ")})` : "")
+    : "Nothing placed yet";
+}
+
+/** Sector sunlight for the production figures, in percent; remembered. */
+let sunlight = (() => {
+  try {
+    return Number(localStorage.getItem("x4sd.sunlight") ?? "100") || 100;
+  } catch {
+    return 100;
+  }
+})();
+/** The sector chosen for the sunlight (its macro), or "" when the % was typed; remembered. */
+let sector = (() => {
+  try {
+    return localStorage.getItem("x4sd.sector") ?? "";
+  } catch {
+    return "";
+  }
+})();
+let sectors: Sector[] = [];
+let analyzed: { scene: Scene; sunlight: number } | null = null;
+
+/** Sets the sunlight (percent) and the sector it comes from ("" for a typed %), remembers both, and updates the figures. */
+function setSunlight(value: number, from: string) {
+  sunlight = value;
+  sector = from;
+  $<HTMLInputElement>("sunlight").value = String(value);
+  $<HTMLSelectElement>("sector").value = from;
+  try {
+    localStorage.setItem("x4sd.sunlight", String(value));
+    localStorage.setItem("x4sd.sector", from);
+  } catch {
+    // Remembering the choice is a convenience only.
+  }
+  void refreshAnalysis();
+  void refreshRates();
+}
+
+/** Fills the Sector list; a remembered sector sets the sunlight again (game data may have changed). */
+async function loadSectors() {
+  sectors = await api.listSectors();
+  $("sector").append(...sectors.map((s) => new Option(`${s.name} (${Math.round(s.sunlight)}%)`, s.macro)));
+  const chosen = sectors.find((s) => s.macro === sector);
+  if (chosen) setSunlight(Math.round(chosen.sunlight * 100) / 100, chosen.macro);
+  else if (sector) setSunlight(sunlight, "");
+}
+
+/** Right pane: what the whole station makes and uses per hour, its workforce, storage and docks. */
+async function refreshAnalysis() {
+  if (!scene || (analyzed?.scene === scene && analyzed.sunlight === sunlight)) return;
+  const request = { scene, sunlight };
+  analyzed = request;
+  let a;
+  try {
+    a = await api.analyzeStation(sunlight);
+  } catch (e) {
+    $("economy-summary").textContent = String(e);
+    return;
+  }
+  if (analyzed !== request) return; // a newer request is on its way
+  const n = (x: number) => Math.round(x).toLocaleString("en-US");
+  const w = a.workforce;
+  const races = w.by_race.map((r) => `${r.race} ${n(r.capacity)}`).join(", ");
+  $("economy-summary").textContent = scene.entries.length
+    ? `Workforce: ${n(w.housed)} housed${races ? ` (${races})` : ""}, ${n(w.needed)} needed` +
+      (w.needed ? ` · bonus ${Math.round(w.fill * 100)}%` : "") +
+      `\nDocks: ${a.dock_areas} dock area${a.dock_areas === 1 ? "" : "s"}, ${a.piers} pier${a.piers === 1 ? "" : "s"}` +
+      (a.flows.length ? "\nNet per hour:" : "")
+    : "Nothing placed yet";
+  $("economy-flows").replaceChildren(
+    ...a.flows
+      .filter((f) => Math.abs(f.net) >= 0.5)
+      .map((f) => {
+        const row = document.createElement("tr");
+        row.innerHTML = `<td></td><td class="n"></td>`;
+        row.title = `Made ${n(f.produced)}, used ${n(f.used)} per hour`;
+        row.children[0].textContent = f.raw ? `${f.name} (raw)` : f.name;
+        row.children[1].textContent = (f.net > 0 ? "+" : "") + n(f.net);
+        row.children[1].className = `n ${f.net > 0 ? "up" : "down"}`;
+        return row;
+      }),
+  );
+  $("economy-storage").textContent = a.storage.length
+    ? "Storage: " +
+      a.storage
+        .map((s) => `${s.transport} ${n(s.capacity)} m³` + (s.hours === null ? "" : ` (≈ ${s.hours < 10 ? s.hours.toFixed(1) : n(s.hours)} h)`))
+        .join(" · ")
+    : "";
+  $("economy-notes").replaceChildren(
+    ...a.notes.map((t) => {
+      const li = document.createElement("li");
+      li.textContent = t;
+      return li;
+    }),
+  );
+}
+
+interface StationLoad { modules: number; connectors: number; turrets: number; shields: number; docks: number; size_km: [number, number, number] }
+let loadRequest = 0;
+
+/** Right pane: what likely costs the game frame rate (players' rules of thumb). */
+async function refreshLoad() {
+  if (!scene) return;
+  const request = ++loadRequest;
+  let l;
+  try {
+    l = (await api.runOp<StationLoad>({ op: "station_load" })).result;
+  } catch (e) {
+    $("load-summary").textContent = String(e);
+    return;
+  }
+  if (request !== loadRequest) return; // a newer request is on its way
+  const km = l.size_km.map((v) => v.toFixed(1)).join(" × ");
+  $("load-summary").textContent = l.modules
+    ? `Modules: ${l.modules} (${l.connectors} connection structure${l.connectors === 1 ? "" : "s"})
+Turrets: ${l.turrets} · Shields: ${l.shields}
+Docks and piers: ${l.docks}
+Size: ${km} km`
+    : "Nothing placed yet";
+}
+
+// ---------------------------------------------------------------- right pane
+
+// A section's title folds it away or opens it; most start folded (see index.html).
+for (const title of document.querySelectorAll<HTMLElement>("#inspector section > h3, #sel-equipment > h4")) {
+  title.onclick = () => title.parentElement!.classList.toggle("collapsed");
+}
+
+// ---------------------------------------------------------------- equipment
+
+let equipmentList: EquipmentItem[] = [];
+let equipRequest = 0;
+const SIZE = (s: string | null) => (s === "medium" ? "M" : s === "large" ? "L" : (s ?? "?"));
+const KIND = { turrets: "turret", shields: "shield" } as const;
+const equipmentName = (m: string) => equipmentList.find((e) => e.macro.toLowerCase() === m.toLowerCase())?.name ?? m;
+
+/** Runs a shared operation that may change the design and redraws; returns its result (null after an error). */
+async function applyOp<T>(op: { op: string } & Record<string, unknown>, done?: (result: T) => string): Promise<T | null> {
+  let result: T | null = null;
+  await apply(
+    api.runOp<T>(op).then((r) => {
+      result = r.result;
+      return r.scene ?? scene!;
+    }),
+  );
+  if (result !== null && done) status(done(result), "good");
+  return result;
+}
+
+/** Selection panel: the selected module's groups, each kind with a choice of what fits and a count. */
+async function refreshEquipment() {
+  const sel = entry(selected);
+  const box = $("sel-equipment");
+  if (!sel || !sel.equipment[1]) {
+    box.hidden = true;
+    return;
+  }
+  const request = ++equipRequest;
+  let groups: EquipmentGroup[];
+  try {
+    groups = (await api.runOp<{ groups: EquipmentGroup[] }>({ op: "module_equipment", index: sel.index })).result.groups;
+  } catch {
+    return;
+  }
+  if (request !== equipRequest) return; // a newer request is on its way
+  box.hidden = false;
+  const rows: HTMLElement[] = [];
+  let last = "";
+  for (const g of groups) {
+    if (g.group !== last) {
+      last = g.group;
+      const title = document.createElement("div");
+      title.className = "equip-group";
+      const name = g.group.replace(/^group0*(\d+)$/, "Group $1").replace(/_/g, " ");
+      title.textContent = name[0].toUpperCase() + name.slice(1);
+      rows.push(title);
+    }
+    const row = document.createElement("div");
+    row.className = "equip-row";
+    const label = document.createElement("span");
+    label.textContent = `${g.slots} × ${SIZE(g.size)} ${KIND[g.kind]}`;
+    const choice = document.createElement("select");
+    choice.append(new Option("—", ""), ...g.fits.map((m) => new Option(equipmentName(m), m)));
+    choice.value = g.current?.macro ?? "";
+    const count = document.createElement("input");
+    count.type = "number";
+    count.min = "1";
+    count.max = String(g.slots);
+    count.value = String(g.current?.count ?? g.slots);
+    count.title = `How many of the ${g.slots} slots to fill`;
+    count.hidden = g.slots < 2;
+    const set = () =>
+      void applyOp({ op: "set_equipment", index: sel.index, group: g.group, kind: g.kind, macro: choice.value || null, count: choice.value ? Number(count.value) : null });
+    choice.onchange = set;
+    count.onchange = () => choice.value && set();
+    row.append(label, choice, count);
+    rows.push(row);
+  }
+  $("sel-equipment-groups").replaceChildren(...rows);
+}
+
+/** Right pane: how many groups of the station are equipped. */
+function renderEquipmentSummary() {
+  const [done, total] = (scene?.entries ?? []).reduce(([a, b], e) => [a + e.equipment[0], b + e.equipment[1]], [0, 0]);
+  $("equip-summary").textContent = total ? `${done} of ${total} turret and shield groups equipped` : "No module here has turret or shield slots";
+}
+
+/** What equip_modules reports, for the status bar. */
+const equipped = (r: { filled: number; cleared: number; skipped: number }) =>
+  [r.filled && `Equipped ${r.filled} groups`, r.cleared && `cleared ${r.cleared}`, r.skipped && `${r.skipped} left as they were (nothing fits)`].filter(Boolean).join(", ") ||
+  "Nothing to equip";
+
+async function loadEquipment() {
+  equipmentList = (await api.runOp<EquipmentItem[]>({ op: "list_equipment" })).result;
+  for (const [kind, size] of [["turrets", "medium"], ["shields", "medium"], ["turrets", "large"], ["shields", "large"]]) {
+    const items = equipmentList.filter((e) => e.kind === kind && e.size === size); // sorted by race, name, macro
+    // Two items with the same name (rare) show their macro too.
+    const label = (e: EquipmentItem) => (items.filter((x) => x.name === e.name).length > 1 ? `${e.name} (${e.macro})` : e.name);
+    $(`pick-${kind}-${size}`).replaceChildren(new Option("—", ""), ...items.map((e) => new Option(label(e), e.macro)));
+  }
+}
+
+const defenceOnly = () => $<HTMLInputElement>("equip-defence-only").checked;
+$("btn-equip-level").onclick = () =>
+  void applyOp({ op: "equip_modules", level: $<HTMLSelectElement>("equip-level").value, defence_only: defenceOnly() }, equipped);
+$("btn-equip-picks").onclick = () => {
+  const picks = ["turrets-medium", "shields-medium", "turrets-large", "shields-large"].map((id) => $<HTMLSelectElement>(`pick-${id}`).value).filter(Boolean);
+  if (!picks.length) {
+    status("Pick at least one turret or shield", "error");
+    return;
+  }
+  void applyOp({ op: "equip_modules", picks, defence_only: defenceOnly() }, equipped);
+};
+$("btn-equip-same").onclick = () => {
+  const sel = entry(selected);
+  if (sel) void applyOp<{ modules: number }>({ op: "copy_equipment", from: sel.index, scope: "same_type" }, (r) => `Copied to ${r.modules} more ${sel.name ?? sel.macro}`);
+};
+$("btn-equip-all").onclick = () => {
+  const sel = entry(selected);
+  if (sel) void applyOp({ op: "copy_equipment", from: sel.index, scope: "all" }, equipped);
+};
+
+// ---------------------------------------------------------------- planner
+
+/** `extras`: other modules to add, with the sides of the station to put them on
+ * (defence platforms); `storage`: m³ per cargo type the station has at least. */
+interface PlannerState {
+  targets: { ware: string; modules: number }[];
+  extras: { macro: string; count: number; sides: string[] }[];
+  race: string;
+  workforce: boolean;
+  hours: number;
+  storage: Record<string, number>;
+  buy: string[];
+  fewerConnectors: boolean;
+}
+let planner: PlannerState = (() => {
+  const fallback: PlannerState = { targets: [], extras: [], race: "", workforce: true, hours: 6, storage: {}, buy: [], fewerConnectors: false };
+  try {
+    return { ...fallback, ...JSON.parse(localStorage.getItem("x4sd.planner") ?? "{}") };
+  } catch {
+    return fallback;
+  }
+})();
+let wareNames = new Map<string, string>();
+/** The last plan, how many of each macro the design had when it was made, and
+ * the wares and other modules it was made for (`asked`; a re-plan keeps them, even
+ * once Place all has cleared the lists).
+ * `optimize`: an Optimize plan (the shortfall fixes), applied with Apply plan;
+ * `dropped` holds the macros of rows the user removed. */
+let plan: { result: ProductionPlan; baseline: Map<string, number>; asked: Pick<PlannerState, "targets" | "extras">; optimize?: { dropped: Set<string> } } | null = null;
+
+/** An Optimize plan's modules, without the rows the user removed. */
+function optimizeModules() {
+  const dropped = plan?.optimize?.dropped;
+  return (plan?.result.modules ?? []).filter((m) => !dropped?.has(m.macro.toLowerCase()));
+}
+
+function savePlanner() {
+  try {
+    localStorage.setItem("x4sd.planner", JSON.stringify(planner));
+  } catch {
+    // Remembering the planner is a convenience only.
+  }
+}
+
+function macroCounts() {
+  const counts = new Map<string, number>();
+  for (const e of scene?.entries ?? []) counts.set(e.macro.toLowerCase(), (counts.get(e.macro.toLowerCase()) ?? 0) + 1);
+  return counts;
+}
+
+/** How many of a planned module the design gained since the plan was made (`now`: `macroCounts()`). */
+function placedOf(m: PlannedModule, now: Map<string, number>) {
+  const key = m.macro.toLowerCase();
+  return Math.min(m.count, Math.max(0, (now.get(key) ?? 0) - (plan?.baseline.get(key) ?? 0)));
+}
+
+/** Sides of the station (the game's axes): id, label, axis. */
+const SIDES: [string, string, string][] = [
+  ["front", "Front", "+Z"],
+  ["back", "Back", "−Z"],
+  ["left", "Left", "−X"],
+  ["right", "Right", "+X"],
+  ["top", "Top", "+Y"],
+  ["bottom", "Bottom", "−Y"],
+];
+
+function renderPlanner() {
+  const n = (x: number) => Math.round(x).toLocaleString("en-US");
+  $("planner-targets").replaceChildren(
+    ...planner.targets.map((t, i) => {
+      const li = document.createElement("li");
+      li.innerHTML = `<span></span><span class="rate"></span><input type="number" min="1" /><button title="Remove">✕</button>`;
+      li.querySelector("span")!.textContent = wareNames.get(t.ware) ?? t.ware;
+      const count = li.querySelector("input")!;
+      count.value = String(t.modules);
+      count.onchange = () => {
+        t.modules = Math.max(1, Math.round(Number(count.value)) || 1);
+        savePlanner();
+        void refreshRates();
+      };
+      li.querySelector("button")!.onclick = () => {
+        planner.targets.splice(i, 1);
+        savePlanner();
+        renderPlanner();
+      };
+      return li;
+    }),
+  );
+  renderRates();
+  void refreshRates();
+  $("planner-extras").replaceChildren(
+    ...planner.extras.map((x, i) => {
+      const li = document.createElement("li");
+      li.innerHTML = `<div><span></span><input type="number" min="1" /><button title="Remove">✕</button></div>`;
+      li.querySelector("span")!.textContent = moduleName(x.macro);
+      const count = li.querySelector("input")!;
+      count.value = String(x.count);
+      count.onchange = () => {
+        x.count = Math.max(1, Math.round(Number(count.value)) || 1);
+        savePlanner();
+      };
+      li.querySelector("button")!.onclick = () => {
+        planner.extras.splice(i, 1);
+        savePlanner();
+        renderPlanner();
+      };
+      if (modules.find((m) => m.macro.toLowerCase() === x.macro.toLowerCase())?.class === "defencemodule") {
+        const chips = document.createElement("div");
+        chips.className = "chips";
+        for (const [side, label, axis] of SIDES) {
+          const b = document.createElement("button");
+          b.textContent = label;
+          b.title = `On the outside of the station on its ${label.toLowerCase()} (${axis}) side, nothing in front of it. The count is spread evenly over the sides picked; none: anywhere`;
+          b.classList.toggle("on", x.sides.includes(side));
+          b.onclick = () => {
+            const on = x.sides.includes(side) ? x.sides.filter((s) => s !== side) : [...x.sides, side];
+            x.sides = SIDES.map((s) => s[0]).filter((s) => on.includes(s));
+            savePlanner();
+            renderPlanner();
+          };
+          chips.append(b);
+        }
+        li.append(chips);
+      }
+      return li;
+    }),
+  );
+  $("planner-buy").replaceChildren(
+    ...planner.buy.map((w) => {
+      const b = document.createElement("button");
+      b.textContent = `Buy ${wareNames.get(w) ?? w} ✕`;
+      b.title = "Bought instead of made; click to make it again";
+      b.onclick = () => {
+        planner.buy = planner.buy.filter((x) => x !== w);
+        savePlanner();
+        void generatePlan(false);
+      };
+      return b;
+    }),
+  );
+  renderBlueprintWarning();
+  if (!plan) return;
+  const { result } = plan;
+  if (plan.optimize) {
+    renderOptimizePlan();
+    return;
+  }
+  $("planner-apply").hidden = true;
+  const now = macroCounts();
+  const groups: [PlannedModule["role"], string][] = [["target", "Targets"], ["extra", "Other modules"], ["chain", "Production chain"], ["habitat", "Habitats"], ["storage", "Storage"], ["dock", "Docks"]];
+  let left = 0;
+  const rows: HTMLElement[] = [];
+  for (const [role, title] of groups) {
+    const members = result.modules.filter((m) => m.role === role);
+    if (!members.length) continue;
+    const h = document.createElement("h4");
+    h.textContent = title;
+    rows.push(h);
+    for (const m of members) {
+      const placed = placedOf(m, now);
+      left += m.count - placed;
+      const row = document.createElement("div");
+      row.className = "planned-row" + (placed >= m.count ? " done" : "");
+      row.title = `${m.macro}: click to place one`;
+      row.innerHTML = `<span class="name"></span><span class="n"></span>`;
+      row.querySelector(".name")!.textContent = m.name;
+      row.querySelector(".n")!.textContent = `${placed}/${m.count}`;
+      if (role === "chain" && m.ware) {
+        const buy = document.createElement("button");
+        buy.textContent = "Buy";
+        buy.title = `Buy ${wareNames.get(m.ware) ?? m.ware} instead of making it`;
+        buy.onclick = (ev) => {
+          ev.stopPropagation();
+          planner.buy.push(m.ware!);
+          savePlanner();
+          void generatePlan(false);
+        };
+        row.append(buy);
+      }
+      row.onclick = () => {
+        const info = modules.find((x) => x.macro.toLowerCase() === m.macro.toLowerCase());
+        if (info) void arm(info);
+      };
+      rows.push(row);
+    }
+  }
+  $("planner-result").replaceChildren(...rows);
+  $("planner-place").hidden = left === 0;
+  $("planner-place").textContent = `Place all (${left})`;
+  const total = result.modules.reduce((s, m) => s + m.count, 0);
+  const short = (raw: boolean) =>
+    result.analysis.flows
+      .filter((f) => f.net < -0.5 && f.raw === raw)
+      .map((f) => `${f.name} ${n(-f.net)}`)
+      .join(", ");
+  $("planner-summary").textContent =
+    (total ? `${total} modules to add, ${left} still to place · ≈ ${n(result.cost.value)} Cr` : result.no_blueprint.length ? "Nothing to add" : "Nothing to add: the station covers its needs") +
+    (result.analysis.self_sufficient ? " · self-sufficient" : "") +
+    (short(true) ? `\nRaw materials to bring in per hour: ${short(true)}` : "") +
+    (short(false) ? `\nTo buy per hour: ${short(false)}` : "") +
+    (result.unknown_targets.length ? `\nNo module makes: ${result.unknown_targets.join(", ")}` : "");
+}
+
+/** The plan's wares that only modules without the player's blueprint make (empty without a plan or the limit). */
+function blockedWares(): string[] {
+  return plan && blueprints.on ? plan.result.no_blueprint.map((w) => wareNames.get(w) ?? w) : [];
+}
+
+/** Warns, above the plan, when the blueprint limit keeps the planner from making something. */
+function renderBlueprintWarning() {
+  const blocked = blockedWares();
+  $("planner-warning").hidden = !blocked.length;
+  $("planner-warning").textContent = blocked.length
+    ? `No blueprint for a module that makes ${blocked.join(", ")}, so the plan can't make ${blocked.length > 1 ? "them" : "it"}: "Only modules I have blueprints for" is on (Modules tab). Untick it to plan with every module, or read a newer save.`
+    : "";
+}
+
+/** What each target's modules make per hour (`refreshRates`), by ware. */
+let rates = new Map<string, TargetRate>();
+let ratesAsked = 0;
+
+/** Planner settings as the core takes them (the right pane's sunlight and build method). */
+function planArgs(targets: { ware: string; modules: number }[], extras: { macro: string; count: number }[]): PlanArgs {
+  return {
+    targets,
+    extra_modules: extras.map(({ macro, count }) => ({ macro, count })),
+    race: planner.race || null,
+    workforce: planner.workforce,
+    storage_hours: planner.hours,
+    storage: planner.storage,
+    buy: planner.buy,
+    sunlight,
+    method: buildMethod,
+  };
+}
+
+/** Asks the core what the targets make per hour (it depends on race, workforce, sunlight and blueprints). */
+async function refreshRates() {
+  const asked = ++ratesAsked;
+  let list: TargetRate[] = [];
+  try {
+    list = planner.targets.length ? await api.targetRates(planArgs(planner.targets, [])) : [];
+  } catch {
+    // Rates are a hint; the plan itself reports problems.
+  }
+  if (asked !== ratesAsked) return; // a newer request is on its way
+  rates = new Map(list.map((r) => [r.ware, r]));
+  renderRates();
+}
+
+/** Each target row's "≈ N/h", or "no blueprint" in red. */
+function renderRates() {
+  const n = (x: number) => Math.round(x).toLocaleString("en-US");
+  $("planner-targets").querySelectorAll("li").forEach((li, i) => {
+    const r = rates.get(planner.targets[i]?.ware);
+    const el = li.querySelector<HTMLElement>(".rate")!;
+    el.classList.toggle("bad", !!r?.no_blueprint);
+    if (r?.per_hour !== undefined) {
+      el.textContent = `≈ ${n(r.per_hour)}/h`;
+      el.title = `${r.name}: ${n(r.per_module!)}/h each` + (planner.workforce ? ", fully staffed" : ", no workforce bonus") + `, at ${sunlight}% sunlight where it applies`;
+    } else {
+      el.textContent = r?.no_blueprint ? "no blueprint" : "";
+      el.title = r?.no_blueprint ? `"Only modules I have blueprints for" is on, and you have no blueprint for a module that makes it` : "";
+    }
+  });
+}
+
+/** An Optimize plan: the modules it adds (chain rows can be bought instead, the
+ * others removed) and an Apply plan button. */
+function renderOptimizePlan() {
+  const n = (x: number) => Math.round(x).toLocaleString("en-US");
+  const { result, optimize } = plan!;
+  const kept = optimizeModules();
+  const groups: [PlannedModule["role"], string][] = [["chain", "Production chain"], ["habitat", "Habitats"], ["storage", "Storage"], ["dock", "Docks"]];
+  const rows: HTMLElement[] = [];
+  for (const [role, title] of groups) {
+    const members = kept.filter((m) => m.role === role);
+    if (!members.length) continue;
+    const h = document.createElement("h4");
+    h.textContent = title;
+    rows.push(h);
+    for (const m of members) {
+      const row = document.createElement("div");
+      row.className = "planned-row";
+      row.title = m.macro;
+      row.innerHTML = `<span class="name"></span><span class="n"></span><button></button>`;
+      row.querySelector(".name")!.textContent = m.name;
+      row.querySelector(".n")!.textContent = `+${m.count}`;
+      const b = row.querySelector("button")!;
+      if (role === "chain" && m.ware) {
+        b.textContent = "Buy";
+        b.title = `Buy ${wareNames.get(m.ware) ?? m.ware} instead of making it (modules that only fed it drop out too)`;
+        b.onclick = () => {
+          planner.buy.push(m.ware!);
+          savePlanner();
+          void generatePlan(false);
+        };
+      } else {
+        b.textContent = "✕";
+        b.title = "Don't add these";
+        b.onclick = () => {
+          optimize!.dropped.add(m.macro.toLowerCase());
+          renderPlanner();
+        };
+      }
+      rows.push(row);
+    }
+  }
+  $("planner-result").replaceChildren(...rows);
+  $("planner-place").hidden = true;
+  $("planner-apply").hidden = false;
+  const total = kept.reduce((s, m) => s + m.count, 0);
+  const rebuild = $<HTMLInputElement>("optimize-rebuild").checked;
+  $<HTMLButtonElement>("planner-apply").disabled = !total && !rebuild;
+  $("planner-apply").textContent = total ? `Apply plan (+${total})` : rebuild ? "Apply plan (re-layout only)" : "Apply plan";
+  const short = result.analysis.flows.filter((f) => f.net < -0.5 && !f.raw).map((f) => `${f.name} ${n(-f.net)}`).join(", ");
+  $("planner-summary").textContent =
+    `Optimize: ${total ? `${total} modules to add · ≈ ${n(result.cost.value)} Cr` : "nothing to add, the station covers its needs"}` +
+    (short ? `\nTo buy per hour: ${short}` : "") +
+    (optimize!.dropped.size ? "\nRemoved rows aren't counted in these figures" : "") +
+    (rebuild ? "\nApply plan adds them and rebuilds the station in layers." : "\nApply plan adds them at free snaps; the station's modules stay where they are.");
+}
+
+/** Plans the targets. `fresh` (Generate plan): a new plan for the design as it is
+ * now. Otherwise (buying a ware, or making it again) the current plan is redone
+ * for the station it was made for, so what is placed keeps counting and its
+ * modules are never added twice. */
+async function generatePlan(fresh: boolean, optimize = false) {
+  if (!scene) return;
+  const baseline = fresh || !plan ? macroCounts() : plan.baseline;
+  // A re-plan (buying a ware) keeps an Optimize plan's mode and removed rows.
+  const mode = fresh ? (optimize ? { dropped: new Set<string>() } : undefined) : plan?.optimize;
+  const asked = fresh || !plan ? structuredClone({ targets: planner.targets, extras: planner.extras }) : plan.asked;
+  let result;
+  try {
+    result = await api.planProduction(
+      planArgs(mode ? [] : asked.targets, mode ? [] : asked.extras),
+      [...baseline].map(([macro, count]) => ({ macro, count })),
+    );
+  } catch (e) {
+    $("planner-summary").textContent = String(e);
+    return;
+  }
+  if (fresh || !plan) $("planner-placed").textContent = "";
+  plan = { result, baseline, asked, optimize: mode };
+  renderPlanner();
+  const blocked = blockedWares();
+  if (blocked.length) status(`No blueprint for a module that makes ${blocked.join(", ")}: see the Planner`, "error");
+}
+
+/** Places every planned module still to place (auto-placement; the plot may grow). */
+async function placeAll() {
+  if (!plan) return;
+  const now = macroCounts();
+  // Sides as picked now, so they can change without planning again.
+  const sides = (macro: string) => planner.extras.find((x) => x.macro.toLowerCase() === macro.toLowerCase())?.sides ?? [];
+  const todo = plan.result.modules.map((m) => ({ macro: m.macro, count: m.count - placedOf(m, now), sides: sides(m.macro) })).filter((m) => m.count > 0);
+  const history = scene?.history ?? 0;
+  const lists = structuredClone({ targets: planner.targets, extras: planner.extras });
+  if (!todo.length || !(await placeModules(todo, true))) return;
+  const after = macroCounts();
+  if (plan.result.modules.some((m) => placedOf(m, after) < m.count)) {
+    dropPlaced(after);
+  } else {
+    // All placed: the wares and other modules to add are done.
+    planner.targets = [];
+    planner.extras = [];
+    savePlanner();
+    renderPlanner();
+  }
+  // What it used up, for an undo to give back.
+  used = {
+    history,
+    targets: lists.targets.map((t) => ({ ...t, modules: t.modules - (planner.targets.find((x) => x.ware === t.ware)?.modules ?? 0) })).filter((t) => t.modules > 0),
+    extras: lists.extras.map((x) => ({ ...x, count: x.count - (planner.extras.find((y) => same(y.macro, x.macro))?.count ?? 0) })).filter((x) => x.count > 0),
+    given: false,
+  };
+}
+
+const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+
+/** The plan items the last Place all used up, and the undo depth before it: undoing
+ * past that gives them back (added to the planner, whatever it holds by then), a
+ * redo takes them again. */
+let used: { history: number; targets: PlannerState["targets"]; extras: PlannerState["extras"]; given: boolean } | null = null;
+
+/** Undo (or redo) one step; across a Place all, its plan items come back (or go again). */
+async function stepHistory(redo: boolean) {
+  await apply(redo ? api.redo() : api.undo());
+  // Nothing to do while the plan items match the history: given back once undone past the Place all.
+  if (!used || !scene || used.given === (scene.history <= used.history)) return;
+  used.given = !used.given;
+  const sign = used.given ? 1 : -1;
+  for (const t of used.targets) {
+    const have = planner.targets.find((x) => x.ware === t.ware);
+    if (have) have.modules += sign * t.modules;
+    else if (sign > 0) planner.targets.push({ ...t });
+  }
+  for (const x of used.extras) {
+    const have = planner.extras.find((y) => same(y.macro, x.macro));
+    if (have) have.count += sign * x.count;
+    else if (sign > 0) planner.extras.push(structuredClone(x));
+  }
+  planner.targets = planner.targets.filter((t) => t.modules > 0);
+  planner.extras = planner.extras.filter((x) => x.count > 0);
+  savePlanner();
+  // A plan on screen is made again from the lists as they are now.
+  if (plan && !plan.optimize) void generatePlan(true);
+  else renderPlanner();
+  if (used.given) status(`Undone; the plan has its ${used.targets.length + used.extras.length} items back`, "good");
+}
+
+/** After a partial build: the targets and other modules to add shrink by what was
+ * placed, and the plan is made again for the station as it is now (`now`:
+ * `macroCounts()`), so it lists only what is left, with its cost and analysis. */
+function dropPlaced(now: Map<string, number>) {
+  if (!plan) return;
+  // Both the planner's lists and what the plan was asked for (the re-plan uses that).
+  const lists = [planner, plan.asked];
+  for (const m of plan.result.modules) {
+    const placed = placedOf(m, now);
+    for (const l of lists) {
+      const target = m.role === "target" ? l.targets.find((t) => t.ware === m.ware) : undefined;
+      if (target) target.modules -= placed;
+      const extra = m.role === "extra" ? l.extras.find((x) => same(x.macro, m.macro)) : undefined;
+      if (extra) extra.count -= placed;
+    }
+  }
+  for (const l of lists) {
+    l.targets = l.targets.filter((t) => t.modules > 0);
+    l.extras = l.extras.filter((x) => x.count > 0);
+  }
+  plan.baseline = now;
+  savePlanner();
+  void generatePlan(false);
+}
+
+/** Places `todo` and reports it. With *Rebuild connection structures* off, at
+ * free snaps: the station's modules move only when nothing else fits (a hub goes
+ * into a joint). On, the whole station is laid out again with them (Optimize's
+ * rebuild). When some find no place, asks whether to keep a partial build; no
+ * undoes it. `offerPlot`: offer a bigger plot if the station outgrew its own.
+ * False if nothing was kept. */
+async function placeModules(todo: { macro: string; count: number; sides?: string[] }[], offerPlot: boolean): Promise<boolean> {
+  const rebuild = $<HTMLInputElement>("optimize-rebuild").checked;
+  const wanted = todo.reduce((s, m) => s + m.count, 0);
+  status(rebuild ? `Rebuilding the station with ${wanted} more modules…` : `Placing ${wanted} modules…`);
+  const history = scene?.history ?? 0;
+  let s: Scene;
+  let p: { placed: number; connectors: number; unplaced: { macro: string; count: number }[]; docks_blocked: number; sides_blocked: number; broken_up: number };
+  let rebuilt: Optimized | null = null;
+  try {
+    if (rebuild) {
+      const r = await api.runOp<Optimized>({
+        op: "optimize_station",
+        ...planArgs([], []),
+        keep_shape: false,
+        fewer_connectors: planner.fewerConnectors,
+        modules: todo.map(({ macro, count }) => ({ macro, count })),
+        partial: true,
+      });
+      s = r.scene!;
+      rebuilt = r.result;
+      // `placed` counts the station's own modules too.
+      p = { placed: rebuilt.placed - rebuilt.moved, connectors: rebuilt.connectors_added, unplaced: rebuilt.unplaced, docks_blocked: rebuilt.docks_blocked, sides_blocked: 0, broken_up: rebuilt.broken_up };
+    } else {
+      s = await api.autoPlace(todo, planner.race || null, planner.fewerConnectors);
+      const x = s.placement!;
+      p = { placed: x.placed.length, connectors: x.connectors.length, unplaced: x.unplaced, docks_blocked: x.docks_blocked, sides_blocked: x.sides_blocked, broken_up: x.broken_up };
+    }
+  } catch (e) {
+    status(String(e), "error");
+    return false;
+  }
+  const left = p.unplaced.map((u) => `${u.count} × ${moduleName(u.macro)}`).join(", ");
+  if (left) {
+    const keep =
+      p.placed > 0 &&
+      (await ask(`Only ${p.placed} of ${wanted} modules fit: no room for ${left}.\n\nKeep the ${p.placed} placed as a partial build? The plan then lists only what is left.`, {
+        title: "Partial build",
+        kind: "warning",
+      }));
+    if (!keep) {
+      // Back to where it was: placing (and fitting the plot after a rebuild) are undo steps of their own.
+      let back = s;
+      while (back.history > history) back = await api.undo();
+      await apply(Promise.resolve(back));
+      const note = `Nothing placed: no room for ${left}`;
+      $("planner-placed").textContent = note;
+      status(note, "error");
+      return false;
+    }
+  }
+  await apply(Promise.resolve(s), undefined, true, offerPlot && !rebuild);
+  const note =
+    (rebuilt
+      ? `Rebuilt the station: re-placed ${rebuilt.moved} modules, added ${p.placed}; connection structures −${rebuilt.connectors_removed} +${p.connectors}` + (rebuilt.plot.plot ? `; plot fitted: ${rebuilt.plot.plot.text}` : "")
+      : `Placed ${p.placed} modules` + (p.connectors ? ` and ${p.connectors} connection structures` : "")) +
+    (p.broken_up ? `. Opened the station up ${p.broken_up === 1 ? "once" : `${p.broken_up} times`} (a connection hub put into a joint, what hung there moved out)` : "") +
+    (p.docks_blocked ? `. ${p.docks_blocked} docks, defence platforms or bays have no clear space` : "") +
+    (p.sides_blocked ? `. ${p.sides_blocked} modules couldn't go on their side (no free snaps there with a clear view out): move them by hand` : "") +
+    (left ? `. Partial build: no room for ${left}` : "");
+  $("planner-placed").textContent = note;
+  status(note, left || p.docks_blocked || p.sides_blocked ? "error" : "good");
+  return true;
+}
+
+async function loadPlanner() {
+  const wares = await api.listWares();
+  wareNames = new Map(wares.map((w) => [w.ware, w.name]));
+  const races = [...new Set(modules.filter((m) => m.class === "habitation" && m.race).map((m) => m.race!))].sort();
+  $("planner-race").replaceChildren(new Option("Any", ""), ...races.map((r) => new Option(r[0].toUpperCase() + r.slice(1), r)));
+  $<HTMLSelectElement>("planner-race").value = planner.race;
+  $<HTMLInputElement>("planner-workforce").checked = planner.workforce;
+  $<HTMLInputElement>("planner-hours").value = String(planner.hours);
+  for (const t of ["container", "solid", "liquid"]) $<HTMLInputElement>(`planner-store-${t}`).value = planner.storage[t] ? amountText(planner.storage[t]) : "";
+  $<HTMLInputElement>("planner-fewer").checked = planner.fewerConnectors;
+  renderPlanner();
+}
+
+$("planner-add").onclick = () => {
+  const text = $<HTMLInputElement>("planner-ware").value.trim().toLowerCase();
+  const ware = [...wareNames].find(([id, name]) => name.toLowerCase() === text || id === text)?.[0];
+  if (!ware) {
+    status(`No module makes "${$<HTMLInputElement>("planner-ware").value}"`);
+    return;
+  }
+  const modulesFor = Math.max(1, Math.round(Number($<HTMLInputElement>("planner-count").value)) || 1);
+  const existing = planner.targets.find((t) => t.ware === ware);
+  if (existing) existing.modules += modulesFor;
+  else planner.targets.push({ ware, modules: modulesFor });
+  $<HTMLInputElement>("planner-ware").value = "";
+  wareSearch.close();
+  savePlanner();
+  renderPlanner();
+};
+
+/** A search box with a list of matches under it: each typed word must be in the
+ * name or id, names starting with the first word first. Arrow keys and Enter, or a
+ * click, pick one; Enter with the list closed calls `enter`. */
+function searchBox(box: HTMLInputElement, list: HTMLElement, entries: () => [string, string][], pick: (id: string, name: string) => void, enter: () => void) {
+  const s = { open: false, matches: [] as [string, string][], active: 0 };
+  const render = () => {
+    const words = box.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const starts = (name: string) => (words.length && name.toLowerCase().startsWith(words[0]) ? 0 : 1);
+    s.matches = entries()
+      .filter(([id, name]) => words.every((w) => name.toLowerCase().includes(w) || id.includes(w)))
+      .sort(([, a], [, b]) => starts(a) - starts(b) || a.localeCompare(b));
+    s.active = Math.min(s.active, Math.max(0, s.matches.length - 1));
+    list.replaceChildren(
+      ...s.matches.map(([id, name], i) => {
+        const row = document.createElement("div");
+        row.textContent = name;
+        if (i === s.active) row.className = "active";
+        // mousedown, not click: the box loses focus (and closes the list) before a click lands.
+        row.onmousedown = (ev) => {
+          ev.preventDefault();
+          pick(id, name);
+        };
+        return row;
+      }),
+    );
+    place();
+  };
+  // The planner tab scrolls, so an absolute list under the box would be clipped.
+  // Pin it to the viewport instead, and keep the highlight inside the list.
+  const place = () => {
+    const show = s.open && s.matches.length > 0;
+    list.hidden = !show;
+    if (!show) return;
+    const active = list.children[s.active];
+    if (active instanceof HTMLElement) {
+      const top = active.offsetTop;
+      const bottom = top + active.offsetHeight;
+      if (top < list.scrollTop) list.scrollTop = top;
+      else if (bottom > list.scrollTop + list.clientHeight) list.scrollTop = bottom - list.clientHeight;
+    }
+    const at = box.getBoundingClientRect();
+    const pane = box.closest("#planner-tab")?.getBoundingClientRect();
+    if (pane && (at.bottom <= pane.top + 4 || at.top >= pane.bottom - 4)) {
+      list.hidden = true;
+      return;
+    }
+    list.style.left = `${at.left}px`;
+    list.style.width = `${at.width}px`;
+    const roomBelow = window.innerHeight - at.bottom;
+    const roomAbove = at.top;
+    const want = Math.min(280, list.scrollHeight);
+    // Open upward when the matches would run past the window, and never taller than the room there.
+    if (want > roomBelow && roomAbove > roomBelow) {
+      list.style.top = "auto";
+      list.style.bottom = `${window.innerHeight - at.top}px`;
+      list.style.maxHeight = `${Math.min(280, Math.max(80, roomAbove - 8))}px`;
+    } else {
+      list.style.bottom = "auto";
+      list.style.top = `${at.bottom}px`;
+      list.style.maxHeight = `${Math.min(280, Math.max(80, roomBelow - 8))}px`;
+    }
+  };
+  box.oninput = () => {
+    s.open = true;
+    s.active = 0;
+    render();
+  };
+  box.onfocus = () => {
+    s.open = true;
+    render();
+  };
+  box.onblur = () => {
+    s.open = false;
+    render();
+  };
+  box.onkeydown = (ev) => {
+    const n = s.matches.length;
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      ev.preventDefault();
+      if (n) s.active = (s.active + (ev.key === "ArrowDown" ? 1 : n - 1)) % n;
+      s.open = true;
+      render();
+    } else if (ev.key === "Enter") {
+      if (s.open && n) pick(...s.matches[s.active]);
+      else enter();
+    } else if (ev.key === "Escape") {
+      s.open = false;
+      render();
+    }
+  };
+  box.closest("#planner-tab")?.addEventListener("scroll", () => {
+    if (s.open) place();
+  });
+  return {
+    close() {
+      s.open = false;
+      render();
+    },
+  };
+}
+
+const wareSearch = searchBox(
+  $<HTMLInputElement>("planner-ware"),
+  $("planner-ware-list"),
+  () => [...wareNames],
+  (_, name) => {
+    $<HTMLInputElement>("planner-ware").value = name;
+    $("planner-add").click();
+  },
+  () => $("planner-add").click(),
+);
+
+/** Classes the planner's Other modules box offers: end uses, not production (wares go in the ware box). */
+const EXTRA_CLASSES = ["defencemodule", "storage", "buildmodule", "pier", "dockarea"];
+/** Other modules the planner can add: defence, storage, ship-building modules, piers and
+ * dock areas of the planner's race, plus universal ones (no race, the palette's
+ * "Generic": the plain ship bays, most dock areas), by macro. */
+const extraModules = () => offered().filter((m) => EXTRA_CLASSES.includes(m.class) && (!planner.race || !m.race || m.race === planner.race));
+const moduleSearch = searchBox(
+  $<HTMLInputElement>("planner-module"),
+  $("planner-module-list"),
+  () => extraModules().map((m) => [m.macro, m.name]),
+  (id) => addExtra(id),
+  () => {
+    const text = $<HTMLInputElement>("planner-module").value.trim().toLowerCase();
+    const found = extraModules().find((m) => m.name.toLowerCase() === text || m.macro.toLowerCase() === text);
+    if (found) addExtra(found.macro);
+    else status(`No defence, storage, ship-building module, pier or dock area "${$<HTMLInputElement>("planner-module").value}"${planner.race ? ` for ${planner.race}` : ""}`);
+  },
+);
+$("planner-module-add").onclick = () => $<HTMLInputElement>("planner-module").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
+
+function addExtra(macro: string) {
+  const count = Math.max(1, Math.round(Number($<HTMLInputElement>("planner-module-count").value)) || 1);
+  const existing = planner.extras.find((x) => x.macro.toLowerCase() === macro.toLowerCase());
+  if (existing) existing.count += count;
+  else planner.extras.push({ macro, count, sides: [] });
+  $<HTMLInputElement>("planner-module").value = "";
+  moduleSearch.close();
+  savePlanner();
+  renderPlanner();
+}
+
+/** "1M", "500k", "250,000" as m³; null if it isn't a number. */
+function parseAmount(text: string) {
+  const m = text.trim().toLowerCase().replace(/[, ]/g, "").match(/^(\d+(?:\.\d+)?)([km]?)$/);
+  return m ? Number(m[1]) * (m[2] === "m" ? 1e6 : m[2] === "k" ? 1e3 : 1) : null;
+}
+const amountText = (n: number) => (n >= 1e6 ? `${n / 1e6}M` : n >= 1e3 ? `${n / 1e3}k` : String(n));
+
+for (const t of ["container", "solid", "liquid"]) {
+  const box = $<HTMLInputElement>(`planner-store-${t}`);
+  box.onchange = () => {
+    const v = parseAmount(box.value);
+    if (box.value.trim() && !v) status(`Storage: give m³, e.g. 1M, 500k or 250000`, "error");
+    if (v) planner.storage[t] = v;
+    else delete planner.storage[t];
+    box.value = v ? amountText(v) : "";
+    savePlanner();
+  };
+}
+
+$<HTMLSelectElement>("planner-race").onchange = (ev) => {
+  planner.race = (ev.target as HTMLSelectElement).value;
+  savePlanner();
+  void refreshRates();
+};
+$<HTMLInputElement>("planner-workforce").onchange = (ev) => {
+  planner.workforce = (ev.target as HTMLInputElement).checked;
+  savePlanner();
+  void refreshRates();
+};
+$<HTMLInputElement>("planner-fewer").onchange = (ev) => {
+  planner.fewerConnectors = (ev.target as HTMLInputElement).checked;
+  savePlanner();
+};
+$<HTMLInputElement>("planner-hours").onchange = (ev) => {
+  planner.hours = Math.max(0, Number((ev.target as HTMLInputElement).value) || 0);
+  savePlanner();
+};
+$("planner-generate").onclick = () => void generatePlan(true);
+$("optimize-rebuild").onchange = () => plan?.optimize && renderPlanner();
+
+interface Optimized {
+  added: { macro: string; count: number }[];
+  moved: number;
+  connectors_removed: number;
+  connectors_added: number;
+  placed: number;
+  unplaced: { macro: string; count: number }[];
+  broken_up: number;
+  docks_blocked: number;
+  plot: { plot: { text: string } | null };
+}
+
+/** Optimize: plan the open station's shortfall fixes (the planner's settings) for the user to trim. */
+$("planner-optimize").onclick = () => {
+  if (!scene?.entries.length) {
+    status("Nothing to optimize: the design is empty", "error");
+    return;
+  }
+  void generatePlan(true, true);
+};
+
+/** Apply plan: add the Optimize plan's modules and fit the plot. With Rebuild
+ * connection structures, the station is re-laid out in layers too. */
+$("planner-apply").onclick = async () => {
+  if (!plan?.optimize) return;
+  const modules = optimizeModules().map((m) => ({ macro: m.macro, count: m.count }));
+  // Rebuild connection structures: the whole station is laid out again (with no modules, a re-layout only).
+  const rebuild = $<HTMLInputElement>("optimize-rebuild").checked;
+  if ((!rebuild && !modules.length) || !(await placeModules(modules, false))) return;
+  if (!rebuild) await apply(api.fitPlot(false));
+  // The plan (if any) was for the station before: start over.
+  plan = null;
+  $("planner-result").replaceChildren();
+  $("planner-summary").textContent = "";
+  $("planner-placed").textContent = "";
+  $("planner-place").hidden = true;
+  $("planner-apply").hidden = true;
+};
+$("planner-place").onclick = () => void placeAll();
+
+/** `index` and every module attached to it, directly or not. */
+function subtree(index: number): Set<number> {
+  const found = new Set([index]);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const e of scene?.entries ?? []) {
+      if (e.attached && found.has(e.attached.to) && !found.has(e.index)) {
+        found.add(e.index);
+        grew = true;
+      }
+    }
+  }
+  return found;
+}
+
+/** Before replacing the design: true when there is nothing unsaved or the user agrees. */
+async function confirmDiscard(): Promise<boolean> {
+  if (!scene?.dirty) return true;
+  return ask(`"${scene.name}" has unsaved changes. Discard them?`, { title: "Unsaved changes", kind: "warning" });
+}
+
+/** Snaps a placed module can connect by: those not holding one of its own attached modules (its shape must be loaded). */
+function connectableSnaps(e: Entry): SnapInfo[] {
+  const held = new Set(scene!.entries.filter((x) => x.attached?.to === e.index).map((x) => x.attached!.to_snap.toLowerCase()));
+  return (shapes.get(e.macro.toLowerCase())?.snaps ?? []).filter((s) => !held.has(s.name.toLowerCase()));
+}
+
+/** Re-attaches the selected module by its snap `snap`, on the same spot with the same twist. */
+async function changeSnap(snap: string) {
+  const sel = entry(selected);
+  const a = sel?.attached;
+  if (!sel || !a || snap === a.snap) return;
+  const label = [...$<HTMLSelectElement>("sel-snap").options].find((o) => o.value === snap)?.text ?? snap;
+  await apply(api.reattachModule(sel.index, snap, a.to, a.to_snap, a.twist ?? 0), `${sel.name ?? sel.macro} now connects by ${label}`, false, true);
+}
+
+$<HTMLSelectElement>("sel-snap").addEventListener("change", (ev) => {
+  const list = ev.target as HTMLSelectElement;
+  list.blur(); // give the keys back
+  void changeSnap(list.value);
+});
+
+/** Move mode: the module (with everything on it) goes onto the next free snap
+ * clicked. With `copy` (Copy sequence), copies of it go onto each snap clicked. */
+async function startMove(index = selected, copy = false) {
+  const e = entry(index);
+  if (!e) return;
+  armed = null;
+  moving = e.index;
+  copying = copy;
+  $("armed-panel").hidden = false;
+  $("armed-title").textContent = copy ? "Copying sequence" : "Moving";
+  $("armed-name").textContent = (e.name ?? e.macro) + (copy ? ` + ${subtree(e.index).size - 1} attached` : "");
+  $("btn-place-root").hidden = true;
+  await shapeOf(e.macro);
+  $<HTMLSelectElement>("armed-snap").replaceChildren(...connectableSnaps(e).map(snapOption));
+  if (e.attached) $<HTMLSelectElement>("armed-snap").value = e.attached.snap;
+  status(
+    copy
+      ? "Pick the snap the copy connects by (orange cones; C cycles, T twists), then click free snaps (cones) to place copies. Esc stops."
+      : "Pick the snap it connects by (orange cones; C cycles, T twists), then click a free snap (cone) to move it there. Esc cancels.",
+  );
+  renderPalette();
+  redraw();
+}
+
+function stopMove() {
+  moving = null;
+  copying = false;
+  $("armed-panel").hidden = !armed;
+  $("armed-title").textContent = "Placing";
+}
+
+async function moveOnto(to: number, toSnap: string) {
+  const index = moving!;
+  const snap = $<HTMLSelectElement>("armed-snap").value;
+  const twist = Number($<HTMLSelectElement>("armed-twist").value);
+  if (copying) {
+    const count = subtree(index).size;
+    await apply(api.copySequence(index, snap, to, toSnap, twist), `Copied ${count} module${count === 1 ? "" : "s"} onto #${to}`, false, true);
+    return;
+  }
+  stopMove();
+  await apply(api.reattachModule(index, snap, to, toSnap, twist), `Moved onto #${to}`, false, true);
+}
+
+/** Copy: place more of a module's type, like a palette click. */
+async function copyModule(index: number | null) {
+  const source = entry(index);
+  const info = source && modules.find((m) => m.macro.toLowerCase() === source.macro.toLowerCase());
+  if (info) await arm(info);
+}
+
+// ---------------------------------------------------------------- actions
+
+async function arm(m: ModuleInfo | null) {
+  if (m) stopMove();
+  armed = m;
+  $("armed-panel").hidden = !m;
+  if (m) {
+    $("armed-name").textContent = m.name;
+    const shape = await shapeOf(m.macro);
+    $<HTMLSelectElement>("armed-snap").replaceChildren(...shape.snaps.map(snapOption));
+    void modelOf(m.macro).then(refreshPlacing); // for the preview
+    status(scene?.entries.length ? "Click or drop onto a free snap (cone) to attach. C cycles the connecting snap, T the twist." : "Click in the view to place it there, or Place as first module (at the origin).");
+  }
+  renderPalette();
+  redraw();
+}
+
+/** Which way a snap faces in its module's own frame (game: +X right, +Y up, +Z front). */
+function snapDirection(s: SnapInfo) {
+  const size = s.facing.map(Math.abs);
+  const axis = size.indexOf(Math.max(...size));
+  return [["right", "left"], ["top", "bottom"], ["front", "back"]][axis][s.facing[axis] >= 0 ? 0 : 1];
+}
+
+const snapOption = (s: SnapInfo) => new Option(`${snapDirection(s)} · ${s.name}`, s.name);
+
+/** While placing or moving: the moving module's own snaps as cones (the chosen
+ * one brighter), and a see-through preview on the hovered free snap. */
+function refreshPlacing() {
+  const picker = $<HTMLSelectElement>("armed-snap");
+  const m = entry(moving);
+  const macro = m?.macro ?? armed?.macro;
+  const shape = macro ? shapes.get(macro.toLowerCase()) : undefined;
+  const offered = new Set([...picker.options].map((o) => o.value));
+  view.setOwnSnaps(m, shape?.snaps.filter((s) => offered.has(s.name)) ?? [], picker.value);
+  const target = hoverTarget && entry(hoverTarget.index);
+  const toSnap = target && shapes.get(target.macro.toLowerCase())?.snaps.find((s) => s.name.toLowerCase() === hoverTarget!.snap.toLowerCase());
+  const own = shape?.snaps.find((s) => s.name === picker.value);
+  if (!target || !toSnap || !own || !macro) return view.setGhost(null);
+  const at = attachMatrix(target, toSnap, own, Number($<HTMLSelectElement>("armed-twist").value));
+  if (!m) return view.setGhost([{ model: models.get(macro.toLowerCase()) ?? null, shape, matrix: at }]);
+  // Moving: everything on it goes along.
+  const delta = at.multiply(poseMatrix(m.position, m.rotation).invert());
+  view.setGhost(
+    [...subtree(m.index)].map((i) => {
+      const e = entry(i)!;
+      const key = e.macro.toLowerCase();
+      return { model: models.get(key) ?? null, shape: shapes.get(key), matrix: delta.clone().multiply(poseMatrix(e.position, e.rotation)) };
+    }),
+  );
+}
+
+function setHover(h: { index: number; snap: string } | null) {
+  if (h?.index === hoverTarget?.index && h?.snap === hoverTarget?.snap) return;
+  hoverTarget = h;
+  refreshPlacing();
+}
+
+/** Steps a placing dropdown (snap or twist) by `by` and updates the preview. */
+function cycle(id: string, by: 1 | -1) {
+  const list = $<HTMLSelectElement>(id);
+  const n = list.options.length;
+  if (n === 0) return;
+  list.selectedIndex = (list.selectedIndex + by + n) % n;
+  refreshPlacing();
+  status(id === "armed-snap" ? `Connects by ${list.selectedOptions[0].text}` : `Twist ${list.value}°`);
+}
+
+for (const id of ["armed-snap", "armed-twist"]) {
+  $<HTMLSelectElement>(id).addEventListener("change", (ev) => {
+    (ev.target as HTMLSelectElement).blur(); // give the keys back
+    refreshPlacing();
+  });
+}
+
+function select(index: number | null) {
+  selected = index;
+  orderAnchor = index;
+  orderSelection = new Set(index === null ? [] : [index]);
+  redraw();
+}
+
+async function attachArmed(to: number, toSnap: string, macro = armed?.macro) {
+  if (!macro) return;
+  const shape = await shapeOf(macro);
+  const chosen = armed?.macro === macro ? $<HTMLSelectElement>("armed-snap").value : shape.snaps[0]?.name;
+  const twist = Number($<HTMLSelectElement>("armed-twist").value);
+  await apply(api.attachModule(macro, chosen, to, toSnap, twist), `Attached ${moduleName(macro)} to #${to}`, false, true);
+}
+
+async function twistSelected(direction: 1 | -1) {
+  const sel = entry(selected);
+  if (!sel?.attached) return;
+  await apply(api.setTwist(sel.index, (sel.attached.twist ?? 0) + direction * rotationStep), undefined, false, true);
+}
+
+// ---------------------------------------------------------------- rotation
+
+/** Step for twists, in degrees; remembered. */
+let rotationStep = (() => {
+  try {
+    return Number(localStorage.getItem("x4sd.rotationStep")) || 90;
+  } catch {
+    return 90;
+  }
+})();
+let gizmoMode: "translate" | "rotate" = "translate";
+
+/** Shows the rotation step everywhere and offers its multiples as attach twists. */
+function renderRotationStep() {
+  document.querySelectorAll<HTMLSelectElement>(".rot-step").forEach((s) => (s.value = String(rotationStep)));
+  const twist = $<HTMLSelectElement>("armed-twist");
+  const keep = Number(twist.value) || 0;
+  const angles = Array.from({ length: 360 / rotationStep }, (_, i) => i * rotationStep);
+  twist.replaceChildren(...angles.map((a) => new Option(String(a), String(a))));
+  twist.value = String(angles.includes(keep) ? keep : 0);
+}
+document.querySelectorAll<HTMLSelectElement>(".rot-step").forEach(
+  (s) =>
+    (s.onchange = () => {
+      rotationStep = Number(s.value);
+      s.blur(); // give the keys back (R / Shift+R ignore a focused dropdown)
+      try {
+        localStorage.setItem("x4sd.rotationStep", String(rotationStep));
+      } catch {
+        // Remembering the step is a convenience only.
+      }
+      renderRotationStep();
+      redraw();
+    }),
+);
+renderRotationStep();
+$("btn-straighten").onclick = () => {
+  const sel = entry(selected);
+  if (sel?.attached) void apply(api.straighten(sel.index), `Straightened ${sel.name ?? sel.macro}`, false, true);
+};
+$("btn-gizmo-mode").onclick = () => {
+  if (selected === null) return;
+  if (armed) {
+    // Placing a module: stop that and rotate the selected one instead.
+    gizmoMode = "rotate";
+    void arm(null);
+    return;
+  }
+  gizmoMode = gizmoMode === "rotate" ? "translate" : "rotate";
+  redraw();
+};
+
+/** Removes the selected module alone (what was on it stays, unattached), or with `sequence` everything on it too. */
+async function removeSelected(sequence = false) {
+  if (selected === null) return;
+  const index = selected;
+  const done = sequence ? `Removed #${index} and everything attached to it` : `Removed #${index}; what was attached to it is now unattached (see Checks)`;
+  await apply(api.removeModule(index, sequence), done);
+}
+
+const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
+
+function choosePlan(title: string, plans: PlanRef[]): Promise<PlanRef | null> {
+  return new Promise((resolve) => {
+    $("modal-title").textContent = title;
+    const body = $("modal-body");
+    const row = (p: PlanRef) => {
+      const el = document.createElement("div");
+      el.className = "plan-row";
+      el.innerHTML = `<div><div class="n"></div><div class="m"></div></div>`;
+      el.querySelector(".n")!.textContent = p.name;
+      const imported = p.source === "import folder";
+      el.querySelector(".m")!.textContent = `${p.modules} modules · ${imported ? fileName(p.file) : (p.source ?? "")} · ${p.id}`;
+      el.onclick = () => close(p);
+      if (imported) {
+        const del = document.createElement("button");
+        del.className = "danger";
+        del.textContent = "Delete";
+        del.title = "Delete this import file";
+        del.onclick = async (ev) => {
+          ev.stopPropagation();
+          const others = plans.filter((x) => x.file === p.file).length - 1;
+          const what = others > 0 ? ` It also holds ${others} other plan(s).` : "";
+          if (!(await ask(`Delete the import file "${fileName(p.file)}"?${what}\n\nThe game's saved plans are not touched.`, { title: "Delete import file", kind: "warning" }))) return;
+          try {
+            await api.deleteImportFile(p.file);
+            plans = plans.filter((x) => x.file !== p.file);
+            render();
+            status(`Deleted ${fileName(p.file)}`, "good");
+          } catch (e) {
+            status(String(e), "error");
+          }
+        };
+        el.append(del);
+      }
+      return el;
+    };
+    const group = (label: string, note: string) => {
+      const h = document.createElement("div");
+      h.className = "plan-group";
+      h.textContent = label + " ";
+      const n = document.createElement("span");
+      n.textContent = note;
+      h.append(n);
+      return h;
+    };
+    // Game plans: the saved ones (in the game) first, then the import files (in the game only once imported).
+    const render = () => {
+      if (!plans.some((p) => p.source)) return body.replaceChildren(...plans.map(row));
+      const saved = plans.filter((p) => p.source !== "import folder");
+      const imports = plans.filter((p) => p.source === "import folder");
+      body.replaceChildren(
+        ...(saved.length ? [group("In the game", "· saved plans"), ...saved.map(row)] : []),
+        ...(imports.length ? [group("Import files", "· constructionplan folder, in the game once imported"), ...imports.map(row)] : []),
+      );
+    };
+    render();
+    const close = (p: PlanRef | null) => {
+      $("modal").hidden = true;
+      resolve(p);
+    };
+    $("modal-close").onclick = () => close(null);
+    $("modal").hidden = false;
+  });
+}
+
+async function openPlans(title: string, plans: PlanRef[]) {
+  if (plans.length === 0) return status("No plans found", "error");
+  if (!(await confirmDiscard())) return;
+  const plan = plans.length === 1 ? plans[0] : await choosePlan(title, plans);
+  if (!plan) return;
+  selected = null;
+  await apply(api.openDesign(plan.file, plan.id), `Opened "${plan.name}"`, true);
+}
+
+async function exportToGame() {
+  try {
+    let result;
+    try {
+      result = await api.exportDesign(false, false);
+    } catch (e) {
+      if (!String(e).startsWith("exists:")) throw e;
+      if (!(await ask(`${String(e).slice(8)}\n\nReplace it?`, { title: "Export to game", kind: "warning" }))) return;
+      result = await api.exportDesign(false, true);
+    }
+    await apply(api.scene());
+    const renamed = result.new_plan ? " as a new plan (it was renamed, so the original stays)" : "";
+    status(`Exported${renamed} to ${result.file}. In game: station build menu → Import.`, "good");
+  } catch (e) {
+    status(String(e), "error");
+  }
+}
+
+// ---------------------------------------------------------------- wiring
+
+$("search").oninput = renderPalette;
+$("search").onkeydown = (ev) => {
+  if (ev.key !== "Escape") return;
+  $<HTMLInputElement>("search").value = "";
+  renderPalette();
+};
+// Give the keys back to the design: Enter in a number box or the plan name applies
+// it and leaves the box (blur fires its change); a checkbox or slider leaves focus
+// once changed. Otherwise Del, R, WASD… stay with the box.
+document.addEventListener("keydown", (ev) => {
+  const t = ev.target;
+  if (ev.key === "Enter" && t instanceof HTMLInputElement && (t.type === "number" || t.id === "design-name")) t.blur();
+});
+document.addEventListener("change", (ev) => {
+  const t = ev.target;
+  if (t instanceof HTMLInputElement && (t.type === "checkbox" || t.type === "range")) t.blur();
+});
+$("order-search").oninput = () => {
+  renderOrder();
+  $("order-list").querySelector(".order-row.match")?.scrollIntoView({ block: "nearest" });
+};
+$("order-search").onkeydown = (ev) => {
+  if (ev.key === "Enter") jumpToMatch(ev.shiftKey ? -1 : 1);
+  else if (ev.key === "Escape") {
+    $<HTMLInputElement>("order-search").value = "";
+    renderOrder();
+  }
+};
+$("class-filter").onchange = renderPalette;
+$("btn-new").onclick = async () => {
+  if (!(await confirmDiscard())) return;
+  selected = null;
+  void apply(api.newDesign("New station"), "New design", true);
+};
+$("btn-open-game").onclick = async () => {
+  try {
+    await openPlans("Open game plan", await api.listGamePlans());
+  } catch (e) {
+    status(String(e), "error");
+  }
+};
+/** The game's plan folder, `<profile>\constructionplan` (its Import and Export files). */
+const planFolder = () => (profileDir ? `${profileDir}\\constructionplan` : null);
+/** The file name the game gives a plan: the name with characters outside `[A-Za-z0-9_-() ]` as `_` (as `import::file_name`). */
+const planFileName = (name: string) => `${name.replace(/[^A-Za-z0-9_\-() ]/g, "_")}.xml`;
+
+$("btn-open-file").onclick = async () => {
+  const file = await open({ defaultPath: planFolder() ?? undefined, filters: [{ name: "Plan files", extensions: ["xml"] }] });
+  if (typeof file !== "string") return;
+  try {
+    await openPlans("Open plan", await api.listPlansInFile(file));
+  } catch (e) {
+    status(String(e), "error");
+  }
+};
+$("btn-save").onclick = async () => {
+  const name = planFileName(scene?.name ?? "station");
+  const folder = planFolder();
+  const file = await save({ defaultPath: folder ? `${folder}\\${name}` : name, filters: [{ name: "Plan file", extensions: ["xml"] }] });
+  if (!file) return;
+  try {
+    const result = await api.saveDesign(file);
+    await apply(api.scene());
+    status(`Saved ${file}${result.new_plan ? " as a new plan (it was renamed, so the original stays)" : ""}`, "good");
+  } catch (e) {
+    status(String(e), "error");
+  }
+};
+$("btn-export").onclick = exportToGame;
+
+/** Sets the blueprint limit, remembers it, and redraws the palette. */
+function setBlueprints(b: Blueprints, tellCore = true) {
+  blueprints = b;
+  owned = ownedSet();
+  try {
+    localStorage.setItem("x4sd.blueprints", JSON.stringify(b));
+  } catch {
+    // Remembering it is a convenience only.
+  }
+  // The core's limit changes the checks (modules without a blueprint) and what the planner can make.
+  void (tellCore ? apply(api.setBlueprints(b)) : scene ? apply(api.scene()) : Promise.resolve()).then(refreshRates, refreshRates);
+  renderBlueprints();
+  renderRaceFilter();
+  renderPalette();
+}
+
+function renderBlueprints() {
+  $<HTMLInputElement>("bp-on").checked = blueprints.on;
+  $("bp-info").hidden = !blueprints.on || !blueprints.save;
+  if (!blueprints.save) return;
+  const read = blueprints.read_at ? new Date(blueprints.read_at * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "";
+  $("bp-save").textContent = `${blueprints.save.split(/[\\/]/).pop()} · ${blueprints.modules.length} modules · read ${read}`;
+  $("bp-save").title = blueprints.save;
+}
+
+/** Reads the blueprints from a save; on failure the limit stays as it was. */
+async function readSave(file: string) {
+  const name = file.split(/[\\/]/).pop();
+  status(`Reading the blueprints in ${name}…`);
+  document.querySelectorAll<HTMLInputElement | HTMLButtonElement>("#bp-toggle input, #bp-info button").forEach((e) => (e.disabled = true));
+  try {
+    setBlueprints(await api.readBlueprints(file), false);
+    status(`${blueprints.modules.length} of ${modules.length} modules have blueprints in ${name}`, "good");
+  } catch (e) {
+    status(String(e), "error");
+    renderBlueprints();
+  } finally {
+    document.querySelectorAll<HTMLInputElement | HTMLButtonElement>("#bp-toggle input, #bp-info button").forEach((e) => (e.disabled = false));
+  }
+}
+
+/** A save picked in the profile's save folder, read. */
+async function pickSave() {
+  const file = await open({ defaultPath: profileDir ? `${profileDir}\\save` : undefined, filters: [{ name: "X4 saves", extensions: ["gz", "xml"] }] });
+  if (typeof file === "string") await readSave(file);
+  else renderBlueprints();
+}
+
+$<HTMLInputElement>("bp-on").onchange = (ev) => {
+  const on = (ev.target as HTMLInputElement).checked;
+  // Turning it on again uses the save read last; only the first time asks for one.
+  if (on && !blueprints.save) void pickSave();
+  else setBlueprints({ ...blueprints, on });
+};
+$("bp-other").onclick = () => void pickSave();
+$("bp-reread").onclick = () => {
+  if (blueprints.save) void readSave(blueprints.save);
+};
+$("btn-undo").onclick = () => stepHistory(false);
+$("btn-redo").onclick = () => stepHistory(true);
+$("btn-frame").onclick = () => view.frame();
+$<HTMLInputElement>("textures").checked = showTextures;
+$<HTMLInputElement>("textures").onchange = async (ev) => {
+  showTextures = (ev.target as HTMLInputElement).checked;
+  try {
+    localStorage.setItem("x4sd.textures", showTextures ? "on" : "off");
+  } catch {
+    // Remembering the choice is a convenience only.
+  }
+  if (showTextures) await loadTextures();
+  redraw();
+};
+/** Frame rate limit of the view (0: the screen's); 60 by default. */
+view.maxFps = (() => {
+  try {
+    return Number(localStorage.getItem("x4sd.maxFps") ?? "60");
+  } catch {
+    return 60;
+  }
+})();
+$<HTMLSelectElement>("max-fps").value = String(view.maxFps);
+$<HTMLSelectElement>("max-fps").onchange = (ev) => {
+  view.maxFps = Number((ev.target as HTMLSelectElement).value);
+  try {
+    localStorage.setItem("x4sd.maxFps", String(view.maxFps));
+  } catch {
+    // Remembering the choice is a convenience only.
+  }
+};
+$<HTMLSelectElement>("quality").value = quality;
+$<HTMLSelectElement>("quality").onchange = async (ev) => {
+  quality = (ev.target as HTMLSelectElement).value as Quality;
+  try {
+    localStorage.setItem("x4sd.quality", quality);
+  } catch {
+    // Remembering the choice is a convenience only.
+  }
+  models.forEach((g) => g?.dispose());
+  models.clear();
+  if (scene) await apply(Promise.resolve(scene), `Model detail: ${quality}`);
+};
+$("btn-twist-left").onclick = () => twistSelected(-1);
+$("btn-twist-right").onclick = () => twistSelected(1);
+$("btn-remove").onclick = () => removeSelected();
+$("btn-remove-sequence").onclick = () => removeSelected(true);
+$<HTMLSelectElement>("build-method").onchange = (ev) => {
+  buildMethod = (ev.target as HTMLSelectElement).value;
+  try {
+    localStorage.setItem("x4sd.method", buildMethod);
+  } catch {
+    // Remembering the choice is a convenience only.
+  }
+  void refreshCost();
+};
+// A typed % wins over the sector; picking a sector sets its %.
+$<HTMLInputElement>("sunlight").onchange = (ev) => {
+  const value = Number((ev.target as HTMLInputElement).value);
+  if (!Number.isFinite(value) || value < 0) return;
+  setSunlight(value, "");
+};
+$<HTMLSelectElement>("sector").onchange = (ev) => {
+  const chosen = sectors.find((s) => s.macro === (ev.target as HTMLSelectElement).value);
+  if (chosen) setSunlight(Math.round(chosen.sunlight * 100) / 100, chosen.macro);
+  else setSunlight(sunlight, "");
+};
+$<HTMLInputElement>("sunlight").value = String(sunlight);
+$("btn-move").onclick = () => startMove();
+$("btn-copy-sequence").onclick = () => startMove(selected, true);
+$("btn-detach").onclick = () => selected !== null && apply(api.detachModule(selected), "Detached: it now stands on its own");
+$("btn-build-first").onclick = () => selected !== null && apply(api.buildFirst(selected), "Moved to the front of the build order");
+$("btn-build-last").onclick = () => selected !== null && apply(api.buildLast(selected), "Moved to the end of the build order");
+$<HTMLInputElement>("stage-end").onchange = (ev) =>
+  selected !== null && apply(api.setStageEnd(selected, (ev.target as HTMLInputElement).checked));
+$<HTMLInputElement>("build-step").oninput = (ev) => {
+  const step = Number((ev.target as HTMLInputElement).value);
+  buildStep = scene && step < scene.entries.length ? step : null;
+  redraw();
+};
+const tabs = [["tab-modules", "modules-tab"], ["tab-order", "order-tab"], ["tab-planner", "planner-tab"]];
+for (const [tab, panel] of tabs) {
+  $(tab).onclick = () => {
+    for (const [t, p] of tabs) {
+      $(t).classList.toggle("on", t === tab);
+      $(p).hidden = p !== panel;
+    }
+  };
+}
+document.querySelectorAll<HTMLInputElement>(".plot-grid input").forEach((input) => (input.onchange = () => apply(plotFromInputs())));
+// Typed position of a free-standing module (metres, game frame): it moves with everything on it.
+document.querySelectorAll<HTMLInputElement>("#sel-position input").forEach(
+  (input) =>
+    (input.onchange = () => {
+      const sel = entry(selected);
+      const pos = [...document.querySelectorAll<HTMLInputElement>("#sel-position input")].map((i) => i.valueAsNumber) as Vec3;
+      if (!sel || sel.attached || pos.some((v) => !Number.isFinite(v))) return;
+      void apply(api.moveRoot(sel.index, pos), `Moved ${sel.name ?? sel.macro} to ${pos.join(", ")} m`, false, true).then(() => view.framePlot());
+    }),
+);
+$("btn-fit-plot").onclick = () => apply(api.fitPlot(false), "Plot fitted to the station");
+$("btn-place-root").onclick = () => armed && placeFirst(armed.macro, [0, 0, 0]);
+$<HTMLInputElement>("design-name").onchange = (ev) => apply(api.renameDesign((ev.target as HTMLInputElement).value));
+
+/** Where a first module goes: the ground-plane point under the cursor, in 10 m steps (else the origin). */
+function firstAt(ev: MouseEvent): Vec3 {
+  const p = view.groundPoint(ev.clientX, ev.clientY);
+  return p ? (p.map((v) => Math.round(v / 10) * 10 + 0) as Vec3) : [0, 0, 0];
+}
+
+/** Places the first module, then selects it and stops placing, so its position fields and gizmo show.
+ * The view backs off 5 km from a tight fit (user request), leaving room for what gets attached next. */
+async function placeFirst(macro: string, at: Vec3) {
+  await apply(api.addModule(macro, at), `Placed ${moduleName(macro)}`, false, true);
+  view.frame(5000);
+  const first = scene?.entries.length === 1 ? scene.entries[0].index : null;
+  if (first === null) return;
+  await arm(null);
+  select(first);
+}
+
+// Click (not drag) in the view: attach to a snap, or select a module. A middle
+// click copies a module, like the game: its type to place, like the palette (with
+// Shift its sequence); the one under the cursor, else the selected one (middle
+// drag still zooms).
+const viewport = $("viewport");
+let down: { x: number; y: number } | null = null;
+viewport.addEventListener("pointerdown", (ev) => (down = { x: ev.clientX, y: ev.clientY }));
+viewport.addEventListener("mousedown", (ev) => ev.button === 1 && ev.preventDefault()); // no autoscroll
+viewport.addEventListener("pointerup", async (ev) => {
+  if (!down || Math.hypot(ev.clientX - down.x, ev.clientY - down.y) > 5) return;
+  if (ev.button === 1) {
+    const pick = view.pick(ev.clientX, ev.clientY);
+    const source = pick?.kind === "module" ? pick.index : selected;
+    if (ev.shiftKey) await startMove(source, true);
+    else await copyModule(source);
+    return;
+  }
+  if (ev.button === 2) {
+    const pick = view.pick(ev.clientX, ev.clientY);
+    if (pick?.kind === "module" && moving === null) openModuleMenu(pick.index, ev.clientX, ev.clientY);
+    return;
+  }
+  if (ev.button !== 0) return;
+  const pick = view.pick(ev.clientX, ev.clientY);
+  if (view.gizmoBusy()) return;
+  if (pick?.kind === "own") {
+    $<HTMLSelectElement>("armed-snap").value = pick.snap;
+    refreshPlacing();
+    status(`Connects by ${$<HTMLSelectElement>("armed-snap").selectedOptions[0]?.text}. Now click a free snap (cone).`);
+  } else if (pick?.kind === "snap" && moving !== null) await moveOnto(pick.index, pick.snap);
+  else if (pick?.kind === "snap" && armed) await attachArmed(pick.index, pick.snap);
+  else if (pick?.kind === "module") select(pick.index);
+  else if (armed && scene?.entries.length === 0) await placeFirst(armed.macro, firstAt(ev));
+  else select(null);
+});
+viewport.addEventListener("pointermove", (ev) => {
+  if ((armed || moving !== null) && !ev.buttons) setHover(view.hoverSnap(ev.clientX, ev.clientY));
+});
+viewport.addEventListener("pointerleave", () => setHover(null));
+
+// Right click (not drag) on a placed module: the game's module menu. It selects the module.
+function openModuleMenu(index: number, x: number, y: number) {
+  select(index);
+  const menu = $("module-menu");
+  $<HTMLButtonElement>("menu-detach").disabled = !entry(index)?.attached;
+  $<HTMLButtonElement>("menu-move").disabled = (scene?.entries.length ?? 0) < 2;
+  menu.hidden = false;
+  const r = menu.getBoundingClientRect(); // kept inside the window
+  menu.style.left = `${Math.min(x, innerWidth - r.width - 4)}px`;
+  menu.style.top = `${Math.min(y, innerHeight - r.height - 4)}px`;
+}
+const closeModuleMenu = () => ($("module-menu").hidden = true);
+const menuActions: Record<string, () => unknown> = {
+  "menu-copy": () => copyModule(selected),
+  "menu-copy-sequence": () => startMove(selected, true),
+  "menu-remove": () => removeSelected(),
+  "menu-remove-sequence": () => removeSelected(true),
+  "menu-move": () => startMove(),
+  "menu-detach": () => $("btn-detach").click(),
+};
+for (const [id, run] of Object.entries(menuActions)) {
+  $(id).onclick = () => {
+    closeModuleMenu();
+    void run();
+  };
+}
+window.addEventListener("pointerdown", (ev) => !$("module-menu").contains(ev.target as Node) && closeModuleMenu(), true);
+window.addEventListener("blur", closeModuleMenu);
+viewport.addEventListener("wheel", closeModuleMenu);
+
+// Drag from the palette onto a snap cone (or anywhere, for the first module).
+viewport.addEventListener("dragover", (ev) => {
+  ev.preventDefault();
+  viewport.classList.add("drop-target");
+  view.hoverSnap(ev.clientX, ev.clientY);
+});
+viewport.addEventListener("dragleave", () => viewport.classList.remove("drop-target"));
+viewport.addEventListener("drop", async (ev) => {
+  ev.preventDefault();
+  viewport.classList.remove("drop-target");
+  const macro = ev.dataTransfer?.getData("text/x4sd-macro");
+  if (!macro) return;
+  const snap = view.hoverSnap(ev.clientX, ev.clientY);
+  if (scene?.entries.length === 0) await placeFirst(macro, firstAt(ev));
+  else if (snap) await attachArmed(snap.index, snap.snap, macro);
+  else status("Drop the module onto a free snap (cone).", "error");
+});
+
+window.addEventListener("keydown", (ev) => {
+  const key = ev.key.toLowerCase();
+  // Undo and redo act on the design, in text and number boxes too: typing is no undo
+  // step (issue #5). preventDefault: else WebView2 undoes the last typing in a box.
+  if (ev.ctrlKey && !ev.altKey && (key === "z" || key === "y")) {
+    ev.preventDefault();
+    return void stepHistory(key === "y" || ev.shiftKey);
+  }
+  if (ev.target instanceof HTMLInputElement || ev.target instanceof HTMLSelectElement) return;
+  if (key === "escape" && !$("module-menu").hidden) return closeModuleMenu();
+  const plain = !ev.ctrlKey && !ev.altKey; // Ctrl+R, Ctrl+F… are not R, F…
+  if (key === "delete") void removeSelected(ev.shiftKey);
+  else if (key === "pageup" && !ev.repeat && !ev.ctrlKey && !ev.altKey && selected !== null) {
+    ev.preventDefault();
+    void apply(api.buildFirst(selected), "Moved to the front of the build order");
+  } else if (key === "pagedown" && !ev.repeat && !ev.ctrlKey && !ev.altKey && selected !== null) {
+    ev.preventDefault();
+    void apply(api.buildLast(selected), "Moved to the end of the build order");
+  }
+  else if (ev.ctrlKey && key === "c") void (ev.shiftKey ? startMove(selected, true) : copyModule(selected));
+  else if (plain && key === "c" && (armed || moving !== null)) cycle("armed-snap", ev.shiftKey ? -1 : 1);
+  else if (plain && key === "t" && (armed || moving !== null)) cycle("armed-twist", ev.shiftKey ? -1 : 1);
+  else if (plain && key === "c" && entry(selected)?.attached) {
+    const list = $<HTMLSelectElement>("sel-snap");
+    const n = list.options.length;
+    if (n > 1) void changeSnap(list.options[(list.selectedIndex + (ev.shiftKey ? -1 : 1) + n) % n].value);
+  }
+  else if (plain && key === "r") void twistSelected(ev.shiftKey ? -1 : 1);
+  else if (plain && key === "f") view.frame();
+  else if (key === "escape") {
+    if (moving !== null) {
+      const done = copying ? "Copying stopped" : "Move cancelled";
+      stopMove();
+      redraw();
+      status(done);
+      return;
+    }
+    void arm(null);
+    select(null);
+  }
+});
+
+// Closing with unsaved changes asks first.
+void getCurrentWindow().onCloseRequested(async (ev) => {
+  if (scene?.dirty && !(await confirmDiscard())) ev.preventDefault();
+});
+
+// An AI agent edited the design through the live link (x4sd mcp).
+void listen<{ scene: Scene; op: string; replaced: boolean }>("scene-changed", (ev) =>
+  apply(Promise.resolve(ev.payload.scene), `Agent: ${ev.payload.op.replace(/_/g, " ")}`, ev.payload.replaced),
+);
+
+// An agent read a save or turned the blueprint limit on or off.
+void listen<Blueprints>("blueprints-changed", (ev) => {
+  setBlueprints(ev.payload, false);
+  status(`Agent: ${blueprints.on ? `only modules with blueprints (${blueprints.modules.length})` : "every module"}`);
+});
+
+// ---------------------------------------------------------------- start
+
+(async () => {
+  try {
+    if (blueprints.save) await api.setBlueprints(blueprints);
+    renderBlueprints();
+    const catalog = await api.loadCatalog().catch(async (e) => {
+      if (!String(e).startsWith("X4 install not found") || !(await chooseGameDir("X4: Foundations wasn't found."))) throw e;
+      return api.loadCatalog();
+    });
+    modules = catalog.modules;
+    profileDir = catalog.profile;
+    void loadPlanner().catch((e) => status(`Planner: ${e}`));
+    void loadEquipment().catch((e) => status(`Equipment: ${e}`));
+    void loadSectors().catch((e) => status(`Sectors: ${e}`));
+    // Game order: by build-menu category, then by name.
+    modules.sort((a, b) => categoryOf(a) - categoryOf(b) || a.name.localeCompare(b.name));
+    const used = new Set(modules.map(categoryOf));
+    $("class-filter").append(...CATEGORIES.flatMap((c, i) => (used.has(i) ? [new Option(c.name, String(i))] : [])));
+    renderRaceFilter();
+    renderPalette();
+    await apply(api.scene(), `${modules.length} modules loaded · profile ${catalog.profile ?? "not found"}`, true);
+  } catch (e) {
+    status(String(e), "error");
+  }
+})();
+
+/** Asks for the X4 folder until the player picks one with game data (true) or cancels. */
+async function chooseGameDir(problem: string): Promise<boolean> {
+  const go = await ask(`${problem}
+
+Choose the X4: Foundations folder (the one with X4.exe)?`, { title: "X4 Station Designer", kind: "warning" });
+  const dir = go ? await open({ directory: true, title: "X4: Foundations folder" }) : null;
+  if (typeof dir !== "string") return false;
+  return api.setGameDir(dir).then(() => true, (e) => chooseGameDir(String(e)));
+}
+
+/** "1.10.0" > "1.9.2": numeric parts, a leading "v" ignored. */
+function newerVersion(a: string, b: string): boolean {
+  const parts = (v: string) => v.replace(/^v/, "").split(".").map((x) => parseInt(x) || 0);
+  const [x, y] = [parts(a), parts(b)];
+  for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) > (y[i] ?? 0);
+  return false;
+}
+
+/** Once per start: if GitHub has a newer release than this one, and newer than the
+ * last one the user skipped, a banner offers it. Offline or failing: nothing. */
+void (async () => {
+  try {
+    const r = await fetch("https://api.github.com/repos/Thiago-Dantas/x4-station-designer/releases/latest");
+    if (!r.ok) return;
+    const { tag_name: tag, html_url: url } = (await r.json()) as { tag_name: string; html_url: string };
+    const skipped = (() => {
+      try {
+        return localStorage.getItem("x4sd.skipVersion") ?? "0";
+      } catch {
+        return "0";
+      }
+    })();
+    if (!newerVersion(tag, await getVersion()) || !newerVersion(tag, skipped)) return;
+    $("update-text").textContent = `X4 Station Designer ${tag.replace(/^v/, "")} is out.`;
+    $("update-download").onclick = () => void openUrl(url);
+    $("update-skip").onclick = () => {
+      try {
+        localStorage.setItem("x4sd.skipVersion", tag);
+      } catch {
+        // Not remembered: it shows again next start.
+      }
+      $("update").hidden = true;
+    };
+    $("update").hidden = false;
+  } catch {
+    // No network or no answer: no banner.
+  }
+})();

@@ -1,0 +1,26 @@
+[package]
+name = "x4sd"
+version = "1.5.3"
+edition.workspace = true
+license.workspace = true
+description = "X4 station designer: visual builder, CLI and MCP server in one exe"
+
+[dependencies]
+x4sd-core = { path = "../x4sd-core" }
+clap = { version = "4", features = ["derive"] }
+rmcp = { version = "3.5.1", features = ["server", "transport-io", "schemars"] }
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "io-std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+schemars = "1.2.3"
+tauri = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+
+[build-dependencies]
+tauri-build = "2"
+
+[features]
+# Embed ui/dist in the exe (Tauri's production mode), so a plain `cargo build` gives the self-contained app.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

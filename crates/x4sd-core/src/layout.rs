@@ -1,0 +1,1558 @@
+//! Overlap checks between placed modules, and automatic placement of a module
+//! list onto free snaps (like the x4ep_planner's "Build This Design").
+//!
+//! Overlaps use each module's collision boxes (`Catalog::collision_boxes`): two
+//! modules overlap when a pair of their boxes intersects deeper than
+//! `OVERLAP_TOLERANCE_M`, unless they are joined at a snap (modules interlock
+//! there by design). The boxes enclose the collision meshes loosely (curves,
+//! diagonals), so `overlaps` (what `validate` reports) confirms each pair on the
+//! meshes themselves (`meshes_intersect`); auto-placement keeps the stricter box
+//! test. Calibration in docs/x4-construction-plans.md, "Overlaps".
+//!
+//! Exclusion zones (`zones`) are the space piers, bays and other modules keep free
+//! for ships (D-12): no other module may reach into them, unless it is joined at a
+//! snap to the zone's module. Calibration in the docs, "Clearance: exclusion zones".
+
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+
+use crate::catalog::{Catalog, CollisionMesh, MeshNode, Module, ShapeBox, Snap};
+use crate::design::Design;
+use crate::geometry::{attach, Quat, Transform};
+use crate::plan::{Plan, Upgrade};
+use crate::planner::{best, candidates, owns, Candidate};
+use crate::plot::{bounds_plot, module_bounds, Plot, MAX_AXIS_KM};
+use crate::{Error, Result};
+
+/// How deep the boxes of two modules may intersect before they overlap: room for
+/// rounding where faces touch (0.4 m at most where Terran modules meet at a snap
+/// in the player's plans); real overlaps are tens of metres.
+pub const OVERLAP_TOLERANCE_M: f64 = 1.0;
+
+/// Placements stay this far (metres) inside the plot, so rounding positions to
+/// what the plan file stores can't push a module out.
+const PLOT_MARGIN_M: f64 = 1.0;
+
+/// Dock areas, piers and defence platforms go outermost: nothing within this
+/// distance (metres) on the line from the station origin out through their centre.
+const DOCK_CLEARANCE_M: f64 = 3_000.0;
+
+/// Snap points closer than this (metres) join two modules (plans store positions
+/// in millimetres; the game's own hand-made plans are off by up to 3.5 cm).
+const JOINED_M: f64 = 0.1;
+
+/// Twists tried when placing a module on a snap.
+const TWISTS: [f64; 4] = [0.0, 90.0, 180.0, 270.0];
+
+/// A module goes onto a new hub instead of a free snap when that puts it this
+/// much nearer the origin. Tried on "100 solar, staffed": 0 m adds 124
+/// connection structures (4.3% of the cost, 7x8x7 km plot), 2 km 81 (2.9%,
+/// 8x8x8 km), 4 km 37 (1.4%, 11x12x12 km).
+const HUB_PENALTY_M: f64 = 2000.0;
+
+/// `HUB_PENALTY_M` with `Options::fewer_connectors`. Tried (connection structures,
+/// plot): "100 solar" 37 (11x12x13 km), the rebuilt TerranScrapyard 1 against 56
+/// (14x16x12 km against 10x10x10); 6 km gives 25 on "100 solar" but 16x16x16 km,
+/// and no limit (hubs only where no free snap fits) a 20 km snake.
+const FEWER_HUBS_PENALTY_M: f64 = 4000.0;
+
+/// A module placed on a side of the station keeps its lane clear this far (metres)
+/// past the station's bounds (see `Placer::lane`).
+const SIDE_LANE_M: f64 = 3_000.0;
+
+/// Joints `Placer::break_up` tries for one module before it gives up.
+const BREAK_UP_TRIES: usize = 40;
+
+/// A side of the station, for modules that face out that way (defence platforms):
+/// front +Z, back −Z, left −X, right +X, top +Y, bottom −Y.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Side {
+    Front,
+    Back,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl Side {
+    pub const ALL: [Side; 6] = [Side::Front, Side::Back, Side::Left, Side::Right, Side::Top, Side::Bottom];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Side::Front => "front",
+            Side::Back => "back",
+            Side::Left => "left",
+            Side::Right => "right",
+            Side::Top => "top",
+            Side::Bottom => "bottom",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Side> {
+        Side::ALL.into_iter().find(|x| x.as_str().eq_ignore_ascii_case(s))
+    }
+
+    /// (axis 0..3, sign) of the side's outward direction.
+    fn axis(self) -> (usize, f64) {
+        match self {
+            Side::Front => (2, 1.0),
+            Side::Back => (2, -1.0),
+            Side::Left => (0, -1.0),
+            Side::Right => (0, 1.0),
+            Side::Top => (1, 1.0),
+            Side::Bottom => (1, -1.0),
+        }
+    }
+}
+
+/// Axis-aligned bounds: (min, max) corner.
+type Bounds = ([f64; 3], [f64; 3]);
+
+/// A module part box in the station frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorldBox {
+    pub centre: [f64; 3],
+    /// The box's own unit axes.
+    pub axes: [[f64; 3]; 3],
+    pub half_extents: [f64; 3],
+}
+
+impl WorldBox {
+    pub fn new(world: &Transform, b: &ShapeBox) -> WorldBox {
+        let frame = world.then(&b.transform);
+        let axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]].map(|a| frame.rotation.rotate(a));
+        WorldBox { centre: frame.position, axes, half_extents: b.half_extents }
+    }
+
+    /// Axis-aligned bounds: (min, max) corner.
+    pub fn bounds(&self) -> Bounds {
+        let reach = [0, 1, 2].map(|i| (0..3).map(|k| self.half_extents[k] * self.axes[k][i].abs()).sum::<f64>());
+        ([0, 1, 2].map(|i| self.centre[i] - reach[i]), [0, 1, 2].map(|i| self.centre[i] + reach[i]))
+    }
+
+    /// Half the box's extent along unit vector `l`.
+    fn radius(&self, l: [f64; 3]) -> f64 {
+        (0..3).map(|k| self.half_extents[k] * dot(self.axes[k], l).abs()).sum()
+    }
+}
+
+/// How deep two boxes intersect, in metres: the shortest distance one has to move
+/// to come free (separating axis theorem over the 15 candidate axes). Negative
+/// when they are apart (then at least that far apart).
+pub fn penetration(a: &WorldBox, b: &WorldBox) -> f64 {
+    let d = sub(b.centre, a.centre);
+    let mut depth = f64::INFINITY;
+    let mut test = |l: [f64; 3]| {
+        let n = dot(l, l).sqrt();
+        if n < 1e-9 {
+            return; // parallel edges: covered by the face axes
+        }
+        let l = l.map(|v| v / n);
+        depth = depth.min(a.radius(l) + b.radius(l) - dot(d, l).abs());
+    };
+    for i in 0..3 {
+        test(a.axes[i]);
+        test(b.axes[i]);
+        for j in 0..3 {
+            test(cross(a.axes[i], b.axes[j]));
+        }
+    }
+    depth
+}
+
+/// A module's collision boxes and snap points in the station frame.
+#[derive(Debug, Clone)]
+pub struct Body {
+    boxes: Vec<WorldBox>,
+    box_bounds: Vec<Bounds>,
+    bounds: Bounds,
+    /// Snap points and the way each faces (its +Z).
+    snaps: Vec<([f64; 3], [f64; 3])>,
+}
+
+impl Body {
+    /// A module with boxes `boxes` (`Catalog::collision_boxes`) and snaps `snaps`,
+    /// both in its own frame, placed at `world`.
+    pub fn new(boxes: &[ShapeBox], snaps: &[Snap], world: &Transform) -> Body {
+        let boxes: Vec<WorldBox> = boxes.iter().map(|b| WorldBox::new(world, b)).collect();
+        let box_bounds: Vec<Bounds> = boxes.iter().map(WorldBox::bounds).collect();
+        let bounds = box_bounds.iter().copied().reduce(union).unwrap_or(([0.0; 3], [0.0; 3]));
+        let snaps = snaps.iter().map(|s| world.then(&s.transform)).map(|t| (t.position, t.rotation.rotate([0.0, 0.0, 1.0]))).collect();
+        Body { boxes, box_bounds, bounds, snaps }
+    }
+
+    /// Axis-aligned bounds of the boxes: (min, max) corner.
+    pub fn bounds(&self) -> ([f64; 3], [f64; 3]) {
+        self.bounds
+    }
+
+    /// Whether `point` lies inside one of its boxes.
+    pub fn contains(&self, point: [f64; 3]) -> bool {
+        self.boxes.iter().any(|b| {
+            let d = sub(point, b.centre);
+            (0..3).all(|k| dot(d, b.axes[k]).abs() <= b.half_extents[k])
+        })
+    }
+
+    /// Whether one of its boxes reaches more than the tolerance into `zone`.
+    pub fn blocks(&self, zone: &WorldBox) -> bool {
+        let tol = OVERLAP_TOLERANCE_M;
+        let (lo, hi) = self.bounds;
+        let whole = WorldBox {
+            centre: [0, 1, 2].map(|i| (lo[i] + hi[i]) / 2.0),
+            axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            half_extents: [0, 1, 2].map(|i| (hi[i] - lo[i]) / 2.0),
+        };
+        penetration(zone, &whole) > tol && self.boxes.iter().any(|b| penetration(zone, b) > tol)
+    }
+
+    /// Whether one of its boxes reaches more than the tolerance into one of `area`'s boxes.
+    fn enters(&self, area: &[Bounds]) -> bool {
+        let tol = OVERLAP_TOLERANCE_M;
+        area.iter().any(|a| intersect(&self.bounds, a, tol) && self.box_bounds.iter().any(|b| intersect(b, a, tol)))
+    }
+
+    /// Whether the two modules meet at a snap (linked, or touching where snaps
+    /// coincide and face each other). Snaps in the same place facing the same way
+    /// mean one module sits where the other's neighbour would.
+    pub fn joined(&self, other: &Body) -> bool {
+        self.snaps.iter().any(|(a, fa)| other.snaps.iter().any(|(b, fb)| dot(sub(*a, *b), sub(*a, *b)) < JOINED_M * JOINED_M && dot(*fa, *fb) < -0.999))
+    }
+}
+
+/// How deep two modules intersect (their deepest pair of boxes), if deeper than
+/// `OVERLAP_TOLERANCE_M` and they aren't joined at a snap.
+pub fn overlap(a: &Body, b: &Body) -> Option<f64> {
+    if a.joined(b) {
+        return None;
+    }
+    intersection_depth(a, b, OVERLAP_TOLERANCE_M)
+}
+
+/// How deep two modules' boxes intersect (their deepest pair), if deeper than `min_depth`.
+pub fn intersection_depth(a: &Body, b: &Body, min_depth: f64) -> Option<f64> {
+    // Boxes intersecting by d overlap by at least d along every direction, so each
+    // box of such a pair reaches more than `min_depth` into the other module's bounds.
+    if !intersect(&a.bounds, &b.bounds, min_depth) {
+        return None;
+    }
+    let near_b: Vec<usize> = (0..b.boxes.len()).filter(|&j| intersect(&b.box_bounds[j], &a.bounds, min_depth)).collect();
+    let mut deepest: Option<f64> = None;
+    for i in (0..a.boxes.len()).filter(|&i| intersect(&a.box_bounds[i], &b.bounds, min_depth)) {
+        for &j in near_b.iter().filter(|&&j| intersect(&a.box_bounds[i], &b.box_bounds[j], min_depth)) {
+            let d = penetration(&a.boxes[i], &b.boxes[j]);
+            if d > min_depth && deepest.is_none_or(|x| d > x) {
+                deepest = Some(d);
+            }
+        }
+    }
+    deepest
+}
+
+/// A module's exclusion zones at `at` (`Module::clearance`, sized by
+/// `Catalog::exclusion_size`): boxes `x` by `y` wide from each zone's connection
+/// along its +Z, `z` long. Zones of a class without a size are left out.
+pub fn zones(catalog: &Catalog, module: &Module, at: &Transform) -> Vec<WorldBox> {
+    module
+        .clearance
+        .iter()
+        .filter_map(|z| {
+            let [x, y, length] = catalog.exclusion_size(&z.tag)?;
+            let along = ShapeBox { transform: Transform { position: [0.0, 0.0, length / 2.0], rotation: Quat::IDENTITY }, half_extents: [x / 2.0, y / 2.0, length / 2.0] };
+            Some(WorldBox::new(&at.then(&z.transform), &along))
+        })
+        .collect()
+}
+
+/// Entries that block another's exclusion zone: (blocker, zone's entry), once per
+/// pair, in plan order of the zone's entry. A module never blocks its own zones, nor
+/// those of a module it is joined to at a snap. Unknown modules are left out.
+pub fn blocked_zones(plan: &Plan, catalog: &Catalog) -> Vec<(u32, u32)> {
+    let placed: Vec<(u32, Arc<Module>, Transform, Body)> = plan
+        .entries
+        .iter()
+        .filter_map(|e| {
+            let (module, boxes) = (catalog.module(&e.macro_name).ok()?, catalog.collision_boxes(&e.macro_name).ok()?);
+            let at = Transform::from_offset(e.offset.as_ref());
+            let body = Body::new(&boxes, &module.snaps, &at);
+            Some((e.index, module, at, body))
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (owner, module, at, own) in &placed {
+        let zones = zones(catalog, module, at);
+        if zones.is_empty() {
+            continue;
+        }
+        for (other, _, _, body) in &placed {
+            if other != owner && !body.joined(own) && zones.iter().any(|z| body.blocks(z)) {
+                out.push((*other, *owner));
+            }
+        }
+    }
+    out
+}
+
+/// Pairs of entries whose modules overlap: their boxes intersect (`overlap`) and
+/// so do their collision meshes (`meshes_intersect`; the box result stands for
+/// modules without meshes). (earlier index, later index, box depth in metres), in
+/// plan order. Unknown modules are left out.
+pub fn overlaps(plan: &Plan, catalog: &Catalog) -> Vec<(u32, u32, f64)> {
+    let bodies: Vec<(u32, &str, Transform, Body)> = plan
+        .entries
+        .iter()
+        .filter_map(|e| {
+            let (module, boxes) = (catalog.module(&e.macro_name).ok()?, catalog.collision_boxes(&e.macro_name).ok()?);
+            let at = Transform::from_offset(e.offset.as_ref());
+            Some((e.index, e.macro_name.as_str(), at, Body::new(&boxes, &module.snaps, &at)))
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (i, (a, macro_a, at_a, body_a)) in bodies.iter().enumerate() {
+        for (b, macro_b, at_b, body_b) in &bodies[i + 1..] {
+            let Some(depth) = overlap(body_a, body_b) else { continue };
+            let confirmed = match (catalog.collision_mesh(macro_a), catalog.collision_mesh(macro_b)) {
+                (Ok(Some(mesh_a)), Ok(Some(mesh_b))) => meshes_intersect(&mesh_a, at_a, &mesh_b, at_b),
+                _ => true,
+            };
+            if confirmed {
+                out.push((*a, *b, depth));
+            }
+        }
+    }
+    out
+}
+
+/// Whether two placed modules' collision meshes intersect: an edge of a triangle
+/// of one passes through the inside of a triangle of the other. Faces or edges
+/// that only touch don't count. Walks both bounding-volume trees together.
+pub fn meshes_intersect(a: &CollisionMesh, at_a: &Transform, b: &CollisionMesh, at_b: &Transform) -> bool {
+    // Work in a's frame: b's tree boxes become oriented boxes there.
+    let rel = at_a.inverse().then(at_b);
+    let node_box = |n: &MeshNode, frame: &Transform| {
+        let centre = [0, 1, 2].map(|k| (f64::from(n.lo[k]) + f64::from(n.hi[k])) / 2.0);
+        let half_extents = [0, 1, 2].map(|k| (f64::from(n.hi[k]) - f64::from(n.lo[k])) / 2.0);
+        WorldBox::new(frame, &ShapeBox { transform: Transform { position: centre, rotation: Quat::IDENTITY }, half_extents })
+    };
+    let size = |n: &MeshNode| (0..3).map(|k| n.hi[k] - n.lo[k]).sum::<f32>();
+    let mut stack = vec![(0u32, 0u32)];
+    while let Some((i, j)) = stack.pop() {
+        let (na, nb) = (&a.nodes[i as usize], &b.nodes[j as usize]);
+        if penetration(&node_box(na, &Transform::IDENTITY), &node_box(nb, &rel)) <= 0.0 {
+            continue;
+        }
+        match (na.children, nb.children) {
+            (None, None) => {
+                if leaves_intersect(a, na, b, nb, &rel) {
+                    return true;
+                }
+            }
+            (Some((l, r)), None) => stack.extend([(l, j), (r, j)]),
+            (None, Some((l, r))) => stack.extend([(i, l), (i, r)]),
+            (Some((l, r)), Some(_)) if size(na) >= size(nb) => stack.extend([(l, j), (r, j)]),
+            (_, Some((l, r))) => stack.extend([(i, l), (i, r)]),
+        }
+    }
+    false
+}
+
+/// Whether any triangle of leaf `na` of `a` crosses one of leaf `nb` of `b`
+/// (`rel` takes b's frame into a's).
+fn leaves_intersect(a: &CollisionMesh, na: &MeshNode, b: &CollisionMesh, nb: &MeshNode, rel: &Transform) -> bool {
+    let corners = |m: &CollisionMesh, n: &MeshNode, frame: Option<&Transform>| -> Vec<[[f64; 3]; 3]> {
+        m.triangles[n.first as usize..(n.first + n.count) as usize]
+            .iter()
+            .map(|t| {
+                t.map(|i| {
+                    let p = m.points[i as usize].map(f64::from);
+                    frame.map_or(p, |f| f.then(&Transform { position: p, rotation: Quat::IDENTITY }).position)
+                })
+            })
+            .collect()
+    };
+    let ta = corners(a, na, None);
+    let tb = corners(b, nb, Some(rel));
+    ta.iter().any(|x| tb.iter().any(|y| triangles_cross(x, y)))
+}
+
+/// Whether two triangles cross: an edge of one passes through the inside of the other.
+fn triangles_cross(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> bool {
+    (0..3).any(|k| segment_through(a[k], a[(k + 1) % 3], b)) || (0..3).any(|k| segment_through(b[k], b[(k + 1) % 3], a))
+}
+
+/// Whether the segment `p`-`q` passes through the inside of triangle `t`
+/// (Möller-Trumbore); touching an edge or lying in its plane doesn't count.
+fn segment_through(p: [f64; 3], q: [f64; 3], t: &[[f64; 3]; 3]) -> bool {
+    const EPS: f64 = 1e-9;
+    let (e1, e2, d) = (sub(t[1], t[0]), sub(t[2], t[0]), sub(q, p));
+    let h = cross(d, e2);
+    let det = dot(e1, h);
+    if det.abs() <= 1e-12 * (dot(e1, e1) * dot(d, d) * dot(e2, e2)).sqrt() {
+        return false; // parallel to the triangle's plane
+    }
+    let s = sub(p, t[0]);
+    let u = dot(s, h) / det;
+    if u <= EPS || u >= 1.0 - EPS {
+        return false;
+    }
+    let r = cross(s, e1);
+    let v = dot(d, r) / det;
+    if v <= EPS || u + v >= 1.0 - EPS {
+        return false;
+    }
+    let along = dot(e2, r) / det;
+    along > EPS && along < 1.0 - EPS
+}
+
+/// What `auto_place` did.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Placement {
+    /// New entries for the requested modules: (index, macro), in placing order.
+    pub placed: Vec<(u32, String)>,
+    /// Connection structures added to hold them: (index, macro).
+    pub connectors: Vec<(u32, String)>,
+    /// Modules that found no place: (macro, count).
+    pub unplaced: Vec<(String, u32)>,
+    /// Dock areas, piers, defence platforms and bays placed without clear space: no such spot.
+    pub docks_blocked: u32,
+    /// Modules placed on a side (`Options::sides`) that found no spot on that half
+    /// of the station with a clear lane out (a tightly packed station may have no
+    /// free snaps there): they went where their lane is clear, else wherever they fit.
+    pub sides_blocked: u32,
+    /// Modules placed by breaking the station up (`Options::break_up`).
+    pub broken_up: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Options {
+    /// Let the station outgrow its plot, up to the largest plot (20 km per axis).
+    pub grow_plot: bool,
+    /// Race of the connection structures; `None`: the most common race of the modules.
+    pub race: Option<String>,
+    /// Place in layers, inside out (see `layer`): modules without turret/shield
+    /// slots first, then defensible ones around them, then dock areas, piers and
+    /// bays; `optimize` uses it. Otherwise: biggest first, docks, piers and bays
+    /// last. Either way Administrative Centres go first (`admin`), defence
+    /// platforms last (`Placer::spread`).
+    pub layered: bool,
+    /// Add a new hub only when it puts the module `FEWER_HUBS_PENALTY_M` nearer the
+    /// centre (instead of `HUB_PENALTY_M`): fewer modules for the game to run, a
+    /// larger station.
+    pub fewer_connectors: bool,
+    /// Modules to place on sides of the station: (macro, sides). That macro's modules
+    /// are spread evenly over its sides, extras to the first ones; each goes on the
+    /// outside of the station on its side, with a clear lane out (`Placer::lane`),
+    /// after every other module.
+    pub sides: Vec<(String, Vec<Side>)>,
+    /// The station modules the player has blueprints for (lowercase macros);
+    /// `None`: all. Connection structures are added only from these.
+    pub owned: Option<HashSet<String>>,
+    /// When a module finds no place, break the station up to make one
+    /// (`Placer::break_up`): modules already on the station may move.
+    pub break_up: bool,
+    /// The plot (without `grow_plot`) holds only the modules that don't need clear
+    /// space; those that do (`outer`) may go past it, up to the largest plot. Stops
+    /// at the first other module that finds no place. `optimize` fills a plot so.
+    pub fill: bool,
+}
+
+/// Attaches the modules (macro, count) to the open design at exact snap
+/// positions, clear of each other and inside the plot, as one undo step.
+///
+/// Greedy: an empty design starts with a connection hub (the race's connection
+/// structure with the most snaps) at the origin. Modules go biggest first, dock
+/// areas, piers and bays last (or in layers, see `Options::layered`). Each goes onto the
+/// free snap nearest the station's centre where it fits, with whichever of its own snaps and twists keeps it most compact; or,
+/// when that is `HUB_PENALTY_M` nearer (with `Options::fewer_connectors`:
+/// `FEWER_HUBS_PENALTY_M`), onto a new hub (or a straight connection structure and
+/// a hub) on a free snap. A placement keeps the station room to grow (a free
+/// snap a hub fits on, `Placer::leaves_exit`) while there is a way to.
+///
+/// Docks and bays stay reachable: the modules that need clear space (`outer`) go
+/// last, where their exclusion zones (`zones`) and, for those that go `outermost`, their
+/// corridor (`corridor`) are clear; no module may enter a placed module's zones or
+/// corridor. Modules already on the station stay where they are.
+pub fn auto_place(catalog: &Catalog, design: &mut Design, modules: &[(String, u32)], options: &Options) -> Result<Placement> {
+    let history = design.history_len();
+    let mut order: Vec<ToPlace> = Vec::new();
+    let mut out = Placement::default();
+    let size = |m: &Module| module_bounds(m, &Transform::IDENTITY).map_or(0.0, |(lo, hi)| (0..3).map(|i| hi[i] - lo[i]).product());
+    for (macro_name, count) in modules {
+        match catalog.module(macro_name) {
+            Ok(m) if !m.snaps.is_empty() => {
+                let s = size(&m);
+                let sides: Vec<Side> = options.sides.iter().filter(|(x, _)| x.eq_ignore_ascii_case(macro_name)).flat_map(|(_, s)| s).copied().collect();
+                order.extend((0..*count as usize).map(|i| (m.clone(), s, (!sides.is_empty()).then(|| sides[i % sides.len()]))));
+            }
+            _ => out.unplaced.push((macro_name.clone(), *count)),
+        }
+    }
+    if order.is_empty() {
+        return Ok(out);
+    }
+    let rank = |m: &Module, side: Option<Side>| {
+        if side.is_some() || defence(m) {
+            4
+        } else if admin(m) {
+            0
+        } else if options.layered {
+            layer(m) + 1
+        } else {
+            u8::from(outer(m)) * 2 + 1
+        }
+    };
+    order.sort_by(|(a, sa, da), (b, sb, db)| rank(a, *da).cmp(&rank(b, *db)).then(sb.total_cmp(sa)).then(a.macro_name.cmp(&b.macro_name)));
+
+    let all = candidates(catalog)?;
+    let race = options.race.clone().or_else(|| common_race(&all, order.iter().map(|o| o.0.macro_name.as_str())));
+    let owned: Vec<Candidate> = all.into_iter().filter(|c| owns(options.owned.as_ref(), &c.info.macro_name)).collect();
+    let connectors = Connectors::choose(catalog, &owned, race.as_deref())?;
+    let plot = if options.grow_plot { None } else { design.plot() };
+    let mut placer = Placer::new(catalog, design, plot)?;
+    placer.hub_penalty = if options.fewer_connectors { FEWER_HUBS_PENALTY_M } else { HUB_PENALTY_M };
+    if design.plan().entries.is_empty() {
+        let hub = design.add_root(catalog, &connectors.hub.module.macro_name, Transform::IDENTITY)?;
+        placer.add(design, hub)?;
+        out.connectors.push((hub, connectors.hub.module.macro_name.clone()));
+    }
+
+    let mut unplaced: BTreeMap<String, u32> = BTreeMap::new();
+    for (module, _, side) in &order {
+        if options.fill && !unplaced.is_empty() {
+            *unplaced.entry(module.macro_name.clone()).or_default() += 1;
+            continue;
+        }
+        placer.plot = if options.fill && outer(module) { None } else { plot };
+        placer.side = *side;
+        placer.spread = side.is_none() && defence(module);
+        // Docks, piers and bays get clear space by any way there is, breaking the
+        // station up if need be, before they go where their approach is blocked.
+        let passes: &[bool] = if options.break_up && side.is_none() && outer(module) { &[true, false] } else { &[false] };
+        let mut result = None;
+        for &clear_only in passes {
+            result = match placer.place(design, &connectors, module, clear_only)? {
+                Some(placed) => Some((placed, Vec::new(), false)),
+                None if options.break_up => placer.break_up(design, &connectors, module, clear_only)?.map(|(placed, renumbered)| (placed, renumbered, true)),
+                None => None,
+            };
+            if result.is_some() {
+                break;
+            }
+        }
+        match result {
+            Some(((index, added), renumbered, broke)) => {
+                let new = |i: u32| renumbered.iter().find(|(old, _)| *old == i).map_or(i, |(_, n)| *n);
+                for (i, _) in out.placed.iter_mut().chain(out.connectors.iter_mut()) {
+                    *i = new(*i);
+                }
+                out.placed.push((index, module.macro_name.clone()));
+                out.connectors.extend(added);
+                out.broken_up += u32::from(broke);
+            }
+            None => *unplaced.entry(module.macro_name.clone()).or_default() += 1,
+        }
+    }
+    out.unplaced.extend(unplaced);
+    out.docks_blocked = placer.blocked;
+    out.sides_blocked = placer.sides_blocked;
+    design.squash_history(history);
+    Ok(out)
+}
+
+/// A module to place: (module, size, the side of the station it goes on).
+type ToPlace = (Arc<Module>, f64, Option<Side>);
+
+/// A dock's clearance corridor: its box (`bounds`) swept `DOCK_CLEARANCE_M` straight
+/// out from the station's centre, as overlapping boxes. `None` at the centre.
+fn corridor(bounds: &Bounds, centre: [f64; 3]) -> Option<Vec<Bounds>> {
+    let mid = [0, 1, 2].map(|i| (bounds.0[i] + bounds.1[i]) / 2.0);
+    let out = sub(mid, centre);
+    let length = dot(out, out).sqrt();
+    if length < 1.0 {
+        return None;
+    }
+    let dir = out.map(|v| v / length);
+    let smallest = (0..3).map(|i| bounds.1[i] - bounds.0[i]).fold(f64::MAX, f64::min);
+    let step = (smallest / 2.0).max(25.0);
+    let steps = (DOCK_CLEARANCE_M / step).ceil() as usize;
+    Some((1..=steps).map(|k| { let s = k as f64 * step; ([0, 1, 2].map(|i| bounds.0[i] + dir[i] * s), [0, 1, 2].map(|i| bounds.1[i] + dir[i] * s)) }).collect())
+}
+
+/// Defence platforms: defence modules with turret/shield slots.
+fn defence(m: &Module) -> bool {
+    m.class == "defencemodule" && !m.equipment_slots.is_empty()
+}
+
+/// Administrative Centres: defence modules without turret/shield slots (all the
+/// `claim` ones, verified 2026-10-15). They go first, innermost (user, 2026-10-15).
+fn admin(m: &Module) -> bool {
+    m.class == "defencemodule" && m.equipment_slots.is_empty()
+}
+
+/// Modules that go outermost, with a clear corridor out (`corridor`): dock areas
+/// and piers (ships have to reach them) and defence platforms (user, 2026-10-15).
+fn outermost(m: &Module) -> bool {
+    m.class == "dockarea" || m.class == "pier" || defence(m)
+}
+
+/// Modules that need clear space around them: those that go `outermost`, and
+/// modules with exclusion zones (fabrication and maintenance bays, scrap processors, radar).
+fn outer(m: &Module) -> bool {
+    outermost(m) || !m.clearance.is_empty()
+}
+
+/// Placement layer, inside out: 0 modules that can't carry turrets or shields
+/// (habitats, welfare…), 1 defensible ones (production, storage), 2 those that
+/// need clear space (`outer`: docks, piers, defence platforms, bays).
+fn layer(m: &Module) -> u8 {
+    if outer(m) {
+        2
+    } else if m.equipment_slots.is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+/// What `optimize` did.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Optimized {
+    /// Modules added (the fixes passed in): (macro, count).
+    pub added: Vec<(String, u32)>,
+    /// Modules the station had that were placed again.
+    pub moved: u32,
+    /// Connection structures removed (a full rebuild removes them all).
+    pub connectors_removed: u32,
+    /// The placement: what went where, and the connection structures added.
+    pub placement: Placement,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OptimizeOptions {
+    /// Keep the connection structures (and the modules carrying them) where they
+    /// are; otherwise rebuild them from scratch.
+    pub keep_shape: bool,
+    /// Let the station outgrow its plot, up to the largest plot (20 km per axis).
+    pub grow_plot: bool,
+    /// Race of the connection structures added; `None`: the most common race of the modules.
+    pub race: Option<String>,
+    /// See `Options::fewer_connectors`.
+    pub fewer_connectors: bool,
+    /// See `Options::owned`.
+    pub owned: Option<HashSet<String>>,
+    /// Keep a partial result when only modules of `fixes` find no place (they are
+    /// in `placement.unplaced`); the station's own modules are never left out.
+    pub partial: bool,
+}
+
+/// Re-lays a station out in layers (see `auto_place`) and adds `fixes` (macro,
+/// count; e.g. the modules that cover its shortfalls), as one undo step.
+///
+/// It lifts the station's modules (keeping the shape: all but the connection
+/// structures and the modules they hang on; else everything), then places them
+/// and the fixes again; each placed module gets the equipment one lifted module
+/// of its type had. All or nothing: if any module finds no place, the design is
+/// left as it was and the error says what didn't fit.
+pub fn optimize(catalog: &Catalog, design: &mut Design, fixes: &[(String, u32)], options: &OptimizeOptions) -> Result<Optimized> {
+    let unknown: Vec<&str> = design.plan().entries.iter().filter(|e| catalog.module(&e.macro_name).is_err()).map(|e| e.macro_name.as_str()).collect();
+    if !unknown.is_empty() {
+        return Err(Error(format!("can't optimize a station with unknown modules: {}", unknown.join(", "))));
+    }
+    let history = design.history_len();
+    let connector = |m: &str| catalog.module(m).is_ok_and(|m| m.class == "connectionmodule");
+    let mut lifted: Vec<(String, Vec<Upgrade>)> = Vec::new();
+    let mut out = Optimized { added: fixes.to_vec(), ..Default::default() };
+    if options.keep_shape {
+        // What no connection structure depends on: modules with nothing attached, repeatedly.
+        loop {
+            let entries = &design.plan().entries;
+            let leaf = entries
+                .iter()
+                .filter(|e| !connector(&e.macro_name))
+                .find(|e| !entries.iter().any(|x| x.predecessor.as_ref().is_some_and(|p| p.index == e.index)));
+            let Some(e) = leaf else { break };
+            lifted.push((e.macro_name.clone(), e.upgrades.clone()));
+            let index = e.index;
+            design.remove(catalog, index)?;
+        }
+    } else {
+        for e in &design.plan().entries {
+            if connector(&e.macro_name) {
+                out.connectors_removed += 1;
+            } else {
+                lifted.push((e.macro_name.clone(), e.upgrades.clone()));
+            }
+        }
+        while let Some(first) = design.plan().entries.first().map(|e| e.index) {
+            design.remove(catalog, first)?;
+        }
+    }
+    out.moved = lifted.len() as u32;
+
+    let mut modules: Vec<(String, u32)> = Vec::new();
+    for m in lifted.iter().map(|(m, _)| (m.as_str(), 1)).chain(fixes.iter().map(|(m, n)| (m.as_str(), *n))) {
+        match modules.iter_mut().find(|(x, _)| x.eq_ignore_ascii_case(m.0)) {
+            Some((_, n)) => *n += m.1,
+            None => modules.push((m.0.to_owned(), m.1)),
+        }
+    }
+    let place = |design: &mut Design, grow_plot: bool, fill: bool| {
+        let o = Options { grow_plot, race: options.race.clone(), layered: true, fewer_connectors: options.fewer_connectors, sides: Vec::new(), owned: options.owned.clone(), break_up: true, fill };
+        auto_place(catalog, design, &modules, &o)
+    };
+    // Fill a plot (user, 2026-10-15: a station that grows arms leaves most of its
+    // plot empty): the smallest cube around the origin that holds the station's
+    // body, 1 km a side larger each try; docks, piers, bays and defence platforms
+    // go around it (`Options::fill`). Only for a rebuild: a kept shape decides
+    // the station's extent itself. Else as before, the station free to grow.
+    let mut placement = None;
+    if options.grow_plot && !options.keep_shape {
+        let plot = design.plot();
+        for km in 1..=MAX_AXIS_KM / 2 {
+            design.set_plot(Some(Plot::around(km)))?;
+            let before = design.history_len();
+            let p = place(design, false, true)?;
+            if p.unplaced.is_empty() {
+                placement = Some(p);
+                break;
+            }
+            if design.history_len() > before {
+                design.squash_history(before);
+                design.undo();
+            }
+        }
+        design.set_plot(plot)?;
+    }
+    let placement = match placement {
+        Some(p) => p,
+        None => place(design, options.grow_plot, false)?,
+    };
+    // Only added modules may stay out, and only when a partial result is wanted.
+    let fixes_only = placement.unplaced.iter().all(|(m, n)| fixes.iter().filter(|(f, _)| f.eq_ignore_ascii_case(m)).map(|f| f.1).sum::<u32>() >= *n);
+    if !placement.unplaced.is_empty() && !(options.partial && fixes_only) {
+        if design.history_len() > history {
+            design.squash_history(history);
+            design.undo();
+        }
+        let left: Vec<String> = placement.unplaced.iter().map(|(m, n)| format!("{n} x {m}")).collect();
+        return Err(Error(format!("nothing changed: no room for {}", left.join(", "))));
+    }
+    // Equipment back: each placed module takes that of one lifted module of its type.
+    let mut equipment: HashMap<String, VecDeque<Vec<Upgrade>>> = HashMap::new();
+    for (m, upgrades) in lifted {
+        equipment.entry(m.to_ascii_lowercase()).or_default().push_back(upgrades);
+    }
+    for (index, m) in &placement.placed {
+        if let Some(upgrades) = equipment.get_mut(&m.to_ascii_lowercase()).and_then(VecDeque::pop_front) {
+            if !upgrades.is_empty() {
+                design.restore_upgrades(*index, upgrades);
+            }
+        }
+    }
+    design.squash_history(history);
+    out.placement = placement;
+    Ok(out)
+}
+
+/// The most common maker race among the modules (`None` if none has one).
+fn common_race<'a>(all: &[Candidate], macros: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut count: BTreeMap<&str, usize> = BTreeMap::new();
+    for m in macros {
+        if let Some(race) = all.iter().find(|c| c.info.macro_name.eq_ignore_ascii_case(m)).and_then(|c| c.race.as_deref()) {
+            *count.entry(race).or_default() += 1;
+        }
+    }
+    count.into_iter().max_by_key(|(_, n)| *n).map(|(r, _)| r.to_owned())
+}
+
+/// A connection structure with its collision boxes.
+struct Piece {
+    module: Arc<Module>,
+    boxes: Arc<Vec<ShapeBox>>,
+}
+
+/// The connection structures the placer adds: a hub, and straight ones (two
+/// opposite snaps) to put a hub further out, shortest first.
+struct Connectors {
+    hub: Piece,
+    struts: Vec<Piece>,
+    /// Each strut's length (metres), in `struts` order.
+    lengths: Vec<f64>,
+}
+
+impl Connectors {
+    /// Chains of two or three struts end to end, one per total length, shortest
+    /// first: for a new hub out past what is in the way (`Placer::reach`).
+    fn chains(&self) -> Vec<Vec<&Piece>> {
+        let n = self.struts.len();
+        let mut out: Vec<(f64, Vec<usize>)> = Vec::new();
+        for a in 0..n {
+            for b in a..n {
+                out.push((self.lengths[a] + self.lengths[b], vec![a, b]));
+                for c in b..n {
+                    out.push((self.lengths[a] + self.lengths[b] + self.lengths[c], vec![a, b, c]));
+                }
+            }
+        }
+        out.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.len().cmp(&y.1.len())));
+        out.dedup_by(|y, x| (x.0 - y.0).abs() < 1.0);
+        out.into_iter().map(|(_, ids)| ids.into_iter().map(|i| &self.struts[i]).collect()).collect()
+    }
+
+    fn choose(catalog: &Catalog, all: &[Candidate], race: Option<&str>) -> Result<Connectors> {
+        let piece = |c: &Candidate| -> Result<Piece> { Ok(Piece { module: c.module.clone(), boxes: catalog.collision_boxes(&c.info.macro_name)? }) };
+        let connection = || all.iter().filter(|c| c.info.class == "connectionmodule");
+        let hub = best(connection().filter(|c| c.module.snaps.len() >= 3), race, |c| c.module.snaps.len() as f64)
+            .ok_or_else(|| Error("no connection structure with three or more snaps".to_owned()))?;
+        let mut struts: Vec<(f64, &Candidate)> = connection()
+            .filter(|c| c.race == hub.race)
+            .filter_map(|c| match c.module.snaps.as_slice() {
+                [a, b] => {
+                    let z = [0.0, 0.0, 1.0];
+                    let facing = dot(a.transform.rotation.rotate(z), b.transform.rotation.rotate(z));
+                    let gap = sub(a.transform.position, b.transform.position);
+                    (facing < -0.999).then(|| (dot(gap, gap).sqrt(), c))
+                }
+                _ => None,
+            })
+            .collect();
+        struts.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.info.macro_name.cmp(&b.1.info.macro_name)));
+        // One per length (a vertical structure is a base structure on its side).
+        struts.dedup_by(|b, a| (a.0 - b.0).abs() < 1.0);
+        let lengths = struts.iter().map(|s| s.0).collect();
+        Ok(Connectors { hub: piece(hub)?, struts: struts.into_iter().map(|(_, c)| piece(c)).collect::<Result<_>>()?, lengths })
+    }
+}
+
+/// A snap nothing uses yet, in the station frame.
+#[derive(Debug, Clone)]
+struct FreeSnap {
+    entry: u32,
+    snap: String,
+    world: Transform,
+}
+
+/// A module at a place where it fits: its body and part-box bounds.
+struct Fit {
+    body: Body,
+    bounds: Bounds,
+}
+
+/// The best way to attach a module to one snap: (own snap, twist, fit).
+type Choice = (String, f64, Fit);
+
+/// A hub placed on a free snap (at the end of a chain of struts, maybe) with a
+/// module on it: (hub snap, hub twist, hub snap the module takes, the module's
+/// choice, the hub's fit, the struts' fits, where the hub goes).
+type Unit = (String, f64, String, Choice, Fit, Vec<Fit>, Transform);
+
+/// A placed module's index, and the connection structures added for it: (index, macro).
+type Placed = (u32, Vec<(u32, String)>);
+
+struct Placer<'a> {
+    catalog: &'a Catalog,
+    /// The plot to stay inside; `None`: any plot the game allows.
+    plot: Option<Plot>,
+    bodies: Vec<Body>,
+    /// Part-box bounds of the whole station (what the plot must hold).
+    bounds: Option<Bounds>,
+    free: Vec<FreeSnap>,
+    /// The entry each body belongs to.
+    owners: Vec<u32>,
+    /// (entry, snap, macro, through a new hub, outward, half, side, reach) that
+    /// didn't fit. Placing only adds obstacles, so what failed once fails again.
+    failed: HashSet<(u32, String, String, bool, bool, bool, Option<Side>, bool)>,
+    /// A module found no place otherwise: new hubs may go at the end of a chain of
+    /// two or three struts (`Connectors::chains`), out past what is in the way.
+    reach: bool,
+    /// Modules that need clear space (`outer`) now need it: clear zones, and for
+    /// those that go `outermost` a clear corridor too (see `corridor`); a module with a
+    /// `side`, a clear lane (`lane`).
+    outward: bool,
+    /// The side of the station the module being placed goes on.
+    side: Option<Side>,
+    /// While `outward`, a module with a `side` must also be on that half of the
+    /// station (all of it beyond the heart that way).
+    half: bool,
+    /// Lanes of modules placed on a side: no module may enter them.
+    lanes: Vec<Bounds>,
+    /// Modules with a side placed off their half of the station or without a clear lane.
+    sides_blocked: u32,
+    /// Corridors of docks on the station that have one: no module may enter them.
+    corridors: Vec<Vec<Bounds>>,
+    /// Exclusion zones on the station that are clear, with the body they belong to:
+    /// no module may enter them, unless it is joined to that body.
+    zones: Vec<(usize, WorldBox)>,
+    /// Outer modules placed without clear space.
+    blocked: u32,
+    /// What "nearest" means: the centre of the station as it was (the origin for
+    /// an empty design), so an off-centre station grows around itself.
+    heart: [f64; 3],
+    /// Placing a defence platform (not on a side): spots rank farthest first,
+    /// away from the defence platforms on the station (`rank`), so they spread
+    /// over its extremities: two arms get one at each end (user, 2026-10-15).
+    spread: bool,
+    /// Centres of the defence platforms on the station.
+    defences: Vec<[f64; 3]>,
+    /// How much nearer the centre a new hub has to put a module (see `Options::fewer_connectors`).
+    hub_penalty: f64,
+    /// Free snaps (entry, snap) a hub doesn't fit on: they stay that way.
+    closed: HashSet<(u32, String)>,
+}
+
+impl<'a> Placer<'a> {
+    fn new(catalog: &'a Catalog, design: &Design, plot: Option<Plot>) -> Result<Placer<'a>> {
+        let mut placer = Placer {
+            catalog,
+            plot,
+            bodies: Vec::new(),
+            bounds: None,
+            free: Vec::new(),
+            owners: Vec::new(),
+            failed: HashSet::new(),
+            reach: false,
+            outward: false,
+            side: None,
+            half: false,
+            lanes: Vec::new(),
+            sides_blocked: 0,
+            corridors: Vec::new(),
+            zones: Vec::new(),
+            blocked: 0,
+            heart: [0.0; 3],
+            spread: false,
+            defences: Vec::new(),
+            hub_penalty: HUB_PENALTY_M,
+            closed: HashSet::new(),
+        };
+        for e in &design.plan().entries {
+            if catalog.module(&e.macro_name).is_ok() {
+                placer.add(design, e.index)?;
+            }
+        }
+        placer.heart = placer.centre();
+        // Docks and bays on the station keep their space clear.
+        for e in &design.plan().entries {
+            if catalog.module(&e.macro_name).is_ok_and(|m| outer(&m)) {
+                placer.protect(design, e.index)?;
+            }
+        }
+        Ok(placer)
+    }
+
+    /// How far from where it should be a module at `offset` from the heart is: its
+    /// distance. On a side: its distance from the axis out through that side less
+    /// how far out it is, so the middle of that face comes first, and spots beside
+    /// the station last. While spreading (`spread`): minus its distance plus its
+    /// distance from the nearest defence platform (at most its distance), so the
+    /// farthest spots come first, and those next to a defence platform later.
+    fn rank(&self, offset: [f64; 3]) -> f64 {
+        if let Some(side) = self.side {
+            let (k, sign) = side.axis();
+            let across: f64 = (0..3).filter(|&i| i != k).map(|i| offset[i] * offset[i]).sum();
+            return across.sqrt() - offset[k] * sign;
+        }
+        let distance = dot(offset, offset).sqrt();
+        if self.spread {
+            let at = [0, 1, 2].map(|i| self.heart[i] + offset[i]);
+            return -distance - self.defences.iter().map(|d| dot(sub(at, *d), sub(at, *d)).sqrt()).fold(distance, f64::min);
+        }
+        distance
+    }
+
+    /// The lane of a module with bounds `bounds` on a side: its bounds extended out
+    /// that way from its face to `SIDE_LANE_M` past the station's bounds.
+    fn lane(&self, bounds: &Bounds, side: Side) -> Bounds {
+        let (k, sign) = side.axis();
+        let (mut lo, mut hi) = *bounds;
+        let station = self.bounds.unwrap_or(*bounds);
+        if sign > 0.0 {
+            (lo[k], hi[k]) = (bounds.1[k], bounds.1[k].max(station.1[k]) + SIDE_LANE_M);
+        } else {
+            (lo[k], hi[k]) = (bounds.0[k].min(station.0[k]) - SIDE_LANE_M, bounds.0[k]);
+        }
+        (lo, hi)
+    }
+
+    /// Whether a module needs a clear corridor (`corridor`): those that go
+    /// `outermost`, unless placed on a side (their lane keeps them outside).
+    fn needs_corridor(&self, module: &Module) -> bool {
+        self.side.is_none() && outermost(module)
+    }
+
+    /// The centre of the station's bounds.
+    fn centre(&self) -> [f64; 3] {
+        self.bounds.map_or([0.0; 3], |(lo, hi)| [0, 1, 2].map(|i| (lo[i] + hi[i]) / 2.0))
+    }
+
+    /// Keeps the exclusion zones of entry `index` and its corridor (if it needs one,
+    /// `needs_corridor`) clear from now on: those that are clear now.
+    fn protect(&mut self, design: &Design, index: u32) -> Result<()> {
+        let e = design.plan().entries.iter().find(|e| e.index == index).ok_or_else(|| Error(format!("no entry {index}")))?;
+        let module = self.catalog.module(&e.macro_name)?;
+        let world = design.world(index)?;
+        if let Some(own) = self.owners.iter().position(|&o| o == index) {
+            for zone in zones(self.catalog, &module, &world) {
+                let clear = self.bodies.iter().enumerate().all(|(i, b)| i == own || b.joined(&self.bodies[own]) || !b.blocks(&zone));
+                if clear {
+                    self.zones.push((own, zone));
+                }
+            }
+        }
+        if !self.needs_corridor(&module) {
+            return Ok(());
+        }
+        let Some(bounds) = module_bounds(&module, &world) else { return Ok(()) };
+        let Some(lane) = corridor(&bounds, self.centre()) else { return Ok(()) };
+        let clear = self.bodies.iter().zip(&self.owners).all(|(b, &owner)| owner == index || !b.enters(&lane));
+        if clear {
+            self.corridors.push(lane);
+        }
+        Ok(())
+    }
+
+    /// Takes a placed entry into account: its body, bounds and free snaps.
+    fn add(&mut self, design: &Design, index: u32) -> Result<()> {
+        let e = design.plan().entries.iter().find(|e| e.index == index).ok_or_else(|| Error(format!("no entry {index}")))?;
+        let module = self.catalog.module(&e.macro_name)?;
+        let world = design.world(index)?;
+        self.bodies.push(Body::new(&self.catalog.collision_boxes(&e.macro_name)?, &module.snaps, &world));
+        self.owners.push(index);
+        if let Some(b) = module_bounds(&module, &world) {
+            self.bounds = Some(self.bounds.map_or(b, |s| union(s, b)));
+            if defence(&module) {
+                self.defences.push([0, 1, 2].map(|i| (b.0[i] + b.1[i]) / 2.0));
+            }
+        }
+        // A free snap meeting another one (facing it, in the same place) closes a loop: nothing fits there.
+        let facing = |a: &Transform, b: &Transform| {
+            let gap = sub(a.position, b.position);
+            dot(gap, gap) < JOINED_M * JOINED_M && dot(a.rotation.rotate([0.0, 0.0, 1.0]), b.rotation.rotate([0.0, 0.0, 1.0])) < -0.999
+        };
+        for s in design.free_snaps(self.catalog, index)? {
+            let before = self.free.len();
+            self.free.retain(|f| !facing(&f.world, &s.world));
+            if self.free.len() == before {
+                self.free.push(FreeSnap { entry: index, snap: s.name, world: s.world });
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes the design in again after modules on it moved (`break_up`): bodies,
+    /// free snaps, zones and corridors anew; what this run decided (the heart,
+    /// lanes, counts, spreading) stays.
+    fn reload(&mut self, design: &Design) -> Result<()> {
+        let fresh = Placer::new(self.catalog, design, self.plot)?;
+        let lanes = std::mem::take(&mut self.lanes);
+        *self = Placer {
+            heart: self.heart,
+            spread: self.spread,
+            hub_penalty: self.hub_penalty,
+            side: self.side,
+            lanes,
+            blocked: self.blocked,
+            sides_blocked: self.sides_blocked,
+            ..fresh
+        };
+        Ok(())
+    }
+
+    /// When nothing else fits: breaks the station up at a joint to make connection
+    /// points (user, 2026-10-15). A hub goes between a module and its predecessor;
+    /// that module, with everything on it, moves out along the joint by the hub's
+    /// length, and the hub's other snaps are new places. Joints nearest the centre
+    /// come first for modules without turret/shield slots (they belong inside),
+    /// the outermost first for the rest. The move must leave everything clear (no
+    /// overlaps, zones, inside the plot), and `module` must then fit on the hub, or
+    /// the design goes back as it was. Returns the placement and the entries the
+    /// new hub renumbered: (old, new).
+    fn break_up(&mut self, design: &mut Design, conn: &Connectors, module: &Module, clear_only: bool) -> Result<Option<(Placed, Vec<(u32, u32)>)>> {
+        let catalog = self.catalog;
+        let plan = design.plan().clone();
+        let hub = &conn.hub;
+        // Joints: (where the snaps meet, child entry).
+        let mut joints: Vec<(f64, u32)> = Vec::new();
+        for e in &plan.entries {
+            let Some(p) = &e.predecessor else { continue };
+            let Some(pred) = plan.entries.iter().find(|x| x.index == p.index) else { continue };
+            let Some(snap) = catalog.module(&pred.macro_name)?.snap(&p.connection).cloned() else { continue };
+            let at = design.world(pred.index)?.then(&snap.transform).position;
+            joints.push((dot(sub(at, self.heart), sub(at, self.heart)).sqrt(), e.index));
+        }
+        if layer(module) == 0 {
+            joints.sort_by(|a, b| a.0.total_cmp(&b.0));
+        } else {
+            joints.sort_by(|a, b| b.0.total_cmp(&a.0));
+        }
+        let facing = |s: &Snap| s.transform.rotation.rotate([0.0, 0.0, 1.0]);
+        let mut tried = 0;
+        for (_, child) in joints {
+            if tried >= BREAK_UP_TRIES {
+                break;
+            }
+            let Some(way) = self.opening(design, &plan, conn, child, &facing)? else { continue };
+            tried += 1;
+            let (hs, ht, ho, ct) = way;
+            let history = design.history_len();
+            let (hub_index, renumbered) = design.insert_between(catalog, child, &hub.module.macro_name, &hs, ht, &ho, ct)?;
+            self.reload(design)?;
+            let boxes = catalog.collision_boxes(&module.macro_name)?;
+            let spots: Vec<FreeSnap> = self.free.iter().filter(|f| f.entry == hub_index).cloned().collect();
+            let mut choice = None;
+            for outward in if clear_only { vec![true] } else if outer(module) { vec![true, false] } else { vec![false] } {
+                self.outward = outward;
+                choice = spots.iter().find_map(|f| self.best_at(module, &boxes, &f.world, &[]).map(|c| (f.clone(), c)));
+                self.outward = false;
+                if choice.is_some() {
+                    break;
+                }
+            }
+            if let Some((f, (snap, twist, _))) = choice {
+                let index = design.attach(catalog, &module.macro_name, &snap, f.entry, &f.snap, twist)?;
+                self.take(f.entry, &f.snap);
+                self.add(design, index)?;
+                if outer(module) {
+                    self.protect(design, index)?;
+                }
+                return Ok(Some(((index, vec![(hub_index, hub.module.macro_name.clone())]), renumbered)));
+            }
+            while design.history_len() > history {
+                design.undo();
+            }
+            self.reload(design)?;
+        }
+        Ok(None)
+    }
+
+    /// A way to put the hub between entry `child` and its predecessor that keeps
+    /// everything clear: (hub snap taking the predecessor's, its twist, hub snap
+    /// `child` moves onto, `child`'s twist there). Checked before anything moves.
+    fn opening(&self, design: &Design, plan: &Plan, conn: &Connectors, child: u32, facing: &dyn Fn(&Snap) -> [f64; 3]) -> Result<Option<(String, f64, String, f64)>> {
+        let catalog = self.catalog;
+        let hub = &conn.hub;
+        let e = plan.entries.iter().find(|x| x.index == child).unwrap();
+        let (Some(conn_snap), Some(p)) = (&e.connection, &e.predecessor) else { return Ok(None) };
+        let pred = plan.entries.iter().find(|x| x.index == p.index).unwrap();
+        let (Some(pred_snap), Some(child_snap)) = (catalog.module(&pred.macro_name)?.snap(&p.connection).cloned(), catalog.module(&e.macro_name)?.snap(conn_snap).cloned()) else {
+            return Ok(None);
+        };
+        let joint = design.world(pred.index)?.then(&pred_snap.transform);
+        let child_world = design.world(child)?;
+        // `child` and everything on it.
+        let mut moved = vec![child];
+        let mut i = 0;
+        while i < moved.len() {
+            let parent = moved[i];
+            moved.extend(plan.entries.iter().filter(|x| x.predecessor.as_ref().is_some_and(|q| q.index == parent)).map(|x| x.index));
+            i += 1;
+        }
+        let others: Vec<usize> = (0..self.bodies.len()).filter(|&b| !moved.contains(&self.owners[b])).collect();
+        for hs in &hub.module.snaps {
+            for ho in hub.module.snaps.iter().filter(|o| dot(facing(o), facing(hs)) < -0.999) {
+                for ht in TWISTS {
+                    let at = attach(&joint, &Transform::IDENTITY, &hs.transform, ht);
+                    let out = at.then(&ho.transform);
+                    let d = sub(out.position, joint.position);
+                    let target = Transform { position: [0, 1, 2].map(|k| child_world.position[k] + d[k]), rotation: child_world.rotation };
+                    let f = crate::geometry::fit(&at, &ho.transform, &target, &child_snap.transform);
+                    if f.gap > 0.05 || f.misalignment > 0.5 {
+                        continue;
+                    }
+                    // The hub and the moved modules, where they would be.
+                    let mut new: Vec<(Body, Bounds, Vec<WorldBox>)> = Vec::new();
+                    let hub_bounds = module_bounds(&hub.module, &at);
+                    new.push((Body::new(&hub.boxes, &hub.module.snaps, &at), hub_bounds.unwrap_or(([0.0; 3], [0.0; 3])), Vec::new()));
+                    for &m in &moved {
+                        let x = plan.entries.iter().find(|x| x.index == m).unwrap();
+                        let mm = catalog.module(&x.macro_name)?;
+                        let w = design.world(m)?;
+                        let w = Transform { position: [0, 1, 2].map(|k| w.position[k] + d[k]), rotation: w.rotation };
+                        let b = module_bounds(&mm, &w).unwrap_or(([0.0; 3], [0.0; 3]));
+                        new.push((Body::new(&catalog.collision_boxes(&x.macro_name)?, &mm.snaps, &w), b, zones(catalog, &mm, &w)));
+                    }
+                    // The hub against what moves past it, and everything moved against what stays.
+                    let (hub_body, moving) = (&new[0].0, &new[1..]);
+                    let hub_clear = moving.iter().all(|(body, _, own_zones)| overlap(body, hub_body).is_none() && !own_zones.iter().any(|z| hub_body.blocks(z) && !hub_body.joined(body)));
+                    let clear = hub_clear && new.iter().all(|(body, _, own_zones)| {
+                        others.iter().all(|&o| overlap(&self.bodies[o], body).is_none() && !own_zones.iter().any(|z| self.bodies[o].blocks(z) && !self.bodies[o].joined(body)))
+                    }) && self.zones.iter().filter(|(owner, _)| !moved.contains(&self.owners[*owner])).all(|(owner, z)| new.iter().all(|(body, ..)| !body.blocks(z) || body.joined(&self.bodies[*owner])));
+                    if !clear {
+                        continue;
+                    }
+                    let m = PLOT_MARGIN_M;
+                    let (lo, hi) = new.iter().fold(self.bounds.unwrap_or(new[0].1), |s, n| union(s, n.1));
+                    let inside = match self.plot {
+                        Some(p) => (0..3).all(|k| hi[k] + m <= p.pos[k] as f64 * 1000.0 && m - lo[k] <= p.neg[k] as f64 * 1000.0),
+                        None => bounds_plot((lo.map(|v| v - m), hi.map(|v| v + m))).is_allowed(),
+                    };
+                    if inside {
+                        return Ok(Some((hs.name.clone(), ht, ho.name.clone(), f.twist)));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn take(&mut self, entry: u32, snap: &str) {
+        self.free.retain(|f| !(f.entry == entry && f.snap == snap));
+    }
+
+    /// Whether the module fits at `at`: inside the plot and clear of every placed
+    /// module and of `extra` (pieces about to be placed).
+    fn fits(&self, module: &Module, boxes: &[ShapeBox], at: &Transform, extra: &[&Fit]) -> Option<Fit> {
+        let bounds = module_bounds(module, at)?;
+        let m = PLOT_MARGIN_M;
+        let inside = match self.plot {
+            Some(p) => (0..3).all(|i| bounds.1[i] + m <= p.pos[i] as f64 * 1000.0 && m - bounds.0[i] <= p.neg[i] as f64 * 1000.0),
+            None => {
+                let (lo, hi) = extra.iter().fold(self.bounds.map_or(bounds, |s| union(s, bounds)), |s, f| union(s, f.bounds));
+                bounds_plot((lo.map(|v| v - m), hi.map(|v| v + m))).is_allowed()
+            }
+        };
+        if !inside {
+            return None;
+        }
+        let body = Body::new(boxes, &module.snaps, at);
+        let clear = self.bodies.iter().chain(extra.iter().map(|f| &f.body)).all(|b| overlap(b, &body).is_none());
+        // Nothing enters a dock's corridor or a zone (unless joined to its module);
+        // an outer module (while `outward`) needs clear space itself.
+        let lanes_free = !self.corridors.iter().any(|lane| body.enters(lane))
+            && !body.enters(&self.lanes)
+            && !self.zones.iter().any(|(owner, zone)| body.blocks(zone) && !body.joined(&self.bodies[*owner]));
+        let lane_clear = |side: Side| {
+            let (k, sign) = side.axis();
+            let lane = [self.lane(&bounds, side)];
+            let near = if sign > 0.0 { bounds.0[k] } else { bounds.1[k] };
+            let on_half = (near - self.heart[k]) * sign > 0.0;
+            (!self.half || on_half) && !self.bodies.iter().chain(extra.iter().map(|f| &f.body)).any(|b| b.enters(&lane))
+        };
+        let open = !self.outward || ((!outer(module) || self.exposed(module, at, &body, &bounds, extra)) && self.side.is_none_or(lane_clear));
+        (clear && lanes_free && open).then_some(Fit { body, bounds })
+    }
+
+    /// Whether a module at `at` (body `body`, part-box bounds `bounds`) has clear
+    /// space: its exclusion zones clear of everything placed (and of `extra`) that
+    /// isn't joined to it, and its corridor if it needs one (`needs_corridor`).
+    fn exposed(&self, module: &Module, at: &Transform, body: &Body, bounds: &Bounds, extra: &[&Fit]) -> bool {
+        let others = || self.bodies.iter().chain(extra.iter().map(|f| &f.body));
+        let zones = zones(self.catalog, module, at);
+        if others().any(|b| !b.joined(body) && zones.iter().any(|z| b.blocks(z))) {
+            return false;
+        }
+        if !self.needs_corridor(module) {
+            return true;
+        }
+        let Some(lane) = corridor(bounds, self.centre()) else { return false };
+        !others().any(|b| b.enters(&lane))
+    }
+
+    /// The most compact way (module centre nearest the origin) to attach the
+    /// module to a snap at `snap` that fits.
+    fn best_at(&self, module: &Module, boxes: &[ShapeBox], snap: &Transform, extra: &[&Fit]) -> Option<Choice> {
+        let mut options: Vec<(f64, &str, f64, Transform)> = Vec::new();
+        for s in &module.snaps {
+            for twist in TWISTS {
+                let at = attach(snap, &Transform::IDENTITY, &s.transform, twist);
+                let Some((lo, hi)) = module_bounds(module, &at) else { continue };
+                let out = [0, 1, 2].map(|i| (lo[i] + hi[i]) / 2.0 - self.heart[i]);
+                options.push((self.rank(out), &s.name, twist, at));
+            }
+        }
+        options.sort_by(|a, b| a.0.total_cmp(&b.0));
+        options.into_iter().find_map(|(_, name, twist, at)| self.fits(module, boxes, &at, extra).map(|f| (name.to_owned(), twist, f)))
+    }
+
+    /// Places one module; returns its index and the connection structures added for it.
+    /// Docks, piers and bays (`outer`) go where they have clear space if they can;
+    /// modules with a `side` on that half of the station with a clear lane, else
+    /// anywhere with a clear lane. `clear_only`: only where it has clear space.
+    fn place(&mut self, design: &mut Design, conn: &Connectors, module: &Module, clear_only: bool) -> Result<Option<Placed>> {
+        let tries: &[(bool, bool)] = if self.side.is_some() {
+            &[(true, true), (true, false), (false, false)]
+        } else if clear_only {
+            &[(true, false)]
+        } else if outer(module) {
+            &[(true, false), (false, false)]
+        } else {
+            &[(false, false)]
+        };
+        // Each way is tried as is, then with chains of struts (`reach`): they add
+        // connection structures, so only when nothing nearer works.
+        for (&(outward, half), reach) in tries.iter().flat_map(|t| [false, true].map(move |r| (t, r))) {
+            (self.outward, self.half, self.reach) = (outward, half, reach);
+            // Keep room to grow (`leaves_exit`) while there is a way to; then fill anyway.
+            let exits = !outward && self.side.is_none();
+            let mut placed = self.place_with(design, conn, module, exits)?;
+            if placed.is_none() && exits {
+                placed = self.place_with(design, conn, module, false)?;
+            }
+            (self.outward, self.half, self.reach) = (false, false, false);
+            if let Some((index, _)) = &placed {
+                if self.side.is_some() && !half {
+                    self.sides_blocked += 1;
+                }
+                if outward {
+                    self.protect(design, *index)?;
+                    if let Some((side, bounds)) = self.side.zip(module_bounds(module, &design.world(*index)?)) {
+                        self.lanes.push(self.lane(&bounds, side));
+                    }
+                } else if self.side.is_none() && outer(module) {
+                    self.blocked += 1;
+                }
+                return Ok(placed);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Places the module at the best free snap; with `keep_exit`, only where the
+    /// station keeps a free snap a hub fits on (`leaves_exit`).
+    fn place_with(&mut self, design: &mut Design, conn: &Connectors, module: &Module, keep_exit: bool) -> Result<Option<Placed>> {
+        let boxes = self.catalog.collision_boxes(&module.macro_name)?;
+        let name = &module.macro_name;
+        // Ways to place it, nearest the station's centre first: directly on a free
+        // snap, or through a new hub there (counted `hub_penalty` further out).
+        let mut options: Vec<(f64, &FreeSnap, bool)> = Vec::new();
+        for f in &self.free {
+            let d = self.rank(sub(f.world.position, self.heart));
+            options.push((d, f, false));
+            options.push((d + self.hub_penalty, f, true));
+        }
+        options.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let options: Vec<(FreeSnap, bool)> = options.into_iter().map(|(_, f, x)| (f.clone(), x)).collect();
+        for (f, through_hub) in options {
+            let key = (f.entry, f.snap.clone(), name.clone(), through_hub, self.outward, self.half, self.side, self.reach);
+            if self.failed.contains(&key) {
+                continue;
+            }
+            if !through_hub && !self.reach {
+                if let Some((snap, twist, fit)) = self.best_at(module, &boxes, &f.world, &[]) {
+                    let new = beyond(module, &[&snap], &attach(&f.world, &Transform::IDENTITY, &module.snap(&snap).unwrap().transform, twist));
+                    if keep_exit && !self.leaves_exit(&conn.hub, &f, &new, &[&fit]) {
+                        continue; // not a failure: it may be fine once the station has other exits
+                    }
+                    let index = design.attach(self.catalog, name, &snap, f.entry, &f.snap, twist)?;
+                    self.take(f.entry, &f.snap);
+                    self.add(design, index)?;
+                    return Ok(Some((index, Vec::new())));
+                }
+            } else {
+                let mut closes = false;
+                let chains = if self.reach { conn.chains() } else { std::iter::once(Vec::new()).chain(conn.struts.iter().map(|s| vec![s])).collect() };
+                for chain in &chains {
+                    if let Some(unit) = self.unit_at(&f, chain, &conn.hub, module, &boxes) {
+                        if keep_exit {
+                            let (hub_snap, _, on, (snap, twist, fit), hub_fit, strut_fits, hub_at) = &unit;
+                            let module_at = attach(&hub_at.then(&conn.hub.module.snap(on).unwrap().transform), &Transform::IDENTITY, &module.snap(snap).unwrap().transform, *twist);
+                            let mut new = beyond(&conn.hub.module, &[hub_snap, on], hub_at);
+                            new.extend(beyond(module, &[snap], &module_at));
+                            let extra: Vec<&Fit> = [fit, hub_fit].into_iter().chain(strut_fits).collect();
+                            if !self.leaves_exit(&conn.hub, &f, &new, &extra) {
+                                closes = true;
+                                continue;
+                            }
+                        }
+                        return self.commit(design, &f, chain, &conn.hub, module, unit).map(Some);
+                    }
+                }
+                if closes {
+                    continue; // as above
+                }
+            }
+            self.failed.insert(key);
+        }
+        Ok(None)
+    }
+
+    /// Whether the station still has room to grow once `module` takes free snap `f`
+    /// with its snap `snap`, twisted `twist` (at `fit`): a free snap left, its own or
+    /// another, that a hub fits on. Without one, modules with a single snap (dead
+    /// ends) can cap every way out of a compact station, and nothing more fits.
+    fn leaves_exit(&mut self, hub: &Piece, f: &FreeSnap, new: &[Transform], extra: &[&Fit]) -> bool {
+        let hub_at = |world: &Transform| attach(world, &Transform::IDENTITY, &hub.module.snaps[0].transform, 0.0);
+        if new.iter().any(|w| self.fits(&hub.module, &hub.boxes, &hub_at(w), extra).is_some()) {
+            return true;
+        }
+        let mut closed = Vec::new();
+        let mut found = false;
+        for g in self.free.iter().filter(|g| !(g.entry == f.entry && g.snap == f.snap)) {
+            let key = (g.entry, g.snap.clone());
+            if self.closed.contains(&key) {
+                continue;
+            }
+            match self.fits(&hub.module, &hub.boxes, &hub_at(&g.world), &[]) {
+                None => closed.push(key),
+                Some(h) if extra.iter().all(|x| overlap(&h.body, &x.body).is_none()) => {
+                    found = true;
+                    break;
+                }
+                Some(_) => {}
+            }
+        }
+        self.closed.extend(closed);
+        found
+    }
+
+    /// A hub at free snap `f` (at the end of `chain`, struts end to end) that the module fits on.
+    fn unit_at(&self, f: &FreeSnap, chain: &[&Piece], hub: &Piece, module: &Module, boxes: &[ShapeBox]) -> Option<Unit> {
+        let mut base = f.world;
+        let mut strut_fits: Vec<Fit> = Vec::new();
+        for s in chain {
+            let at = attach(&base, &Transform::IDENTITY, &s.module.snaps[0].transform, 0.0);
+            base = at.then(&s.module.snaps[1].transform);
+            let fit = self.fits(&s.module, &s.boxes, &at, &strut_fits.iter().collect::<Vec<_>>())?;
+            strut_fits.push(fit);
+        }
+        let extra: Vec<&Fit> = strut_fits.iter().collect();
+        // Hub placements that put its snaps in the same places are the same for the module.
+        let mut seen: Vec<Vec<[i64; 3]>> = Vec::new();
+        for hs in &hub.module.snaps {
+            for twist in [0.0, 90.0] {
+                let at = attach(&base, &Transform::IDENTITY, &hs.transform, twist);
+                let mut key: Vec<[i64; 3]> = hub.module.snaps.iter().map(|s| at.then(&s.transform).position.map(|v| v.round() as i64)).collect();
+                key.sort();
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.push(key);
+                let Some(hub_fit) = self.fits(&hub.module, &hub.boxes, &at, &extra) else { continue };
+                let extra: Vec<&Fit> = extra.iter().copied().chain(std::iter::once(&hub_fit)).collect();
+                let best = hub
+                    .module
+                    .snaps
+                    .iter()
+                    .filter(|o| o.name != hs.name)
+                    .filter_map(|o| self.best_at(module, boxes, &at.then(&o.transform), &extra).map(|c| (o.name.clone(), c)))
+                    .min_by(|a, b| {
+                        let rank = |c: &Choice| self.rank([0, 1, 2].map(|i| (c.2.bounds.0[i] + c.2.bounds.1[i]) / 2.0 - self.heart[i]));
+                        rank(&a.1).total_cmp(&rank(&b.1))
+                    });
+                if let Some((on, choice)) = best {
+                    return Some((hs.name.clone(), twist, on, choice, hub_fit, strut_fits, at));
+                }
+            }
+        }
+        None
+    }
+
+    fn commit(
+        &mut self,
+        design: &mut Design,
+        f: &FreeSnap,
+        chain: &[&Piece],
+        hub: &Piece,
+        module: &Module,
+        (hub_snap, hub_twist, on, (snap, twist, _), ..): Unit,
+    ) -> Result<Placed> {
+        let mut added = Vec::new();
+        let (mut to, mut to_snap) = (f.entry, f.snap.clone());
+        self.take(f.entry, &f.snap);
+        for s in chain {
+            let (a, b) = (&s.module.snaps[0].name, &s.module.snaps[1].name);
+            let index = design.attach(self.catalog, &s.module.macro_name, a, to, &to_snap, 0.0)?;
+            self.add(design, index)?;
+            added.push((index, s.module.macro_name.clone()));
+            (to, to_snap) = (index, b.clone());
+            self.take(to, &to_snap);
+        }
+        let index = design.attach(self.catalog, &hub.module.macro_name, &hub_snap, to, &to_snap, hub_twist)?;
+        self.add(design, index)?;
+        added.push((index, hub.module.macro_name.clone()));
+        let placed = design.attach(self.catalog, &module.macro_name, &snap, index, &on, twist)?;
+        self.take(index, &on);
+        self.add(design, placed)?;
+        Ok((placed, added))
+    }
+}
+
+/// Where the snaps of a module at `at` are, but those named `used`.
+fn beyond(module: &Module, used: &[&str], at: &Transform) -> Vec<Transform> {
+    module.snaps.iter().filter(|s| !used.contains(&s.name.as_str())).map(|s| at.then(&s.transform)).collect()
+}
+
+/// Whether the bounds overlap by more than `margin` along every axis.
+fn intersect(a: &Bounds, b: &Bounds, margin: f64) -> bool {
+    (0..3).all(|i| a.1[i] - b.0[i] > margin && b.1[i] - a.0[i] > margin)
+}
+
+fn union(a: Bounds, b: Bounds) -> Bounds {
+    ([0, 1, 2].map(|i| a.0[i].min(b.0[i])), [0, 1, 2].map(|i| a.1[i].max(b.1[i])))
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::{Axis, Quat};
+
+    fn cube(position: [f64; 3], yaw: f64, half: f64) -> WorldBox {
+        let world = Transform { position, rotation: Quat::axis_angle(Axis::Y, yaw) };
+        WorldBox::new(&world, &ShapeBox { transform: Transform::IDENTITY, half_extents: [half; 3] })
+    }
+
+    #[test]
+    fn penetration_of_boxes() {
+        let a = cube([0.0; 3], 0.0, 100.0);
+        // Faces 10 m into each other, touching, and 50 m apart.
+        assert!((penetration(&a, &cube([190.0, 0.0, 0.0], 0.0, 100.0)) - 10.0).abs() < 1e-9);
+        assert!(penetration(&a, &cube([200.0, 0.0, 0.0], 0.0, 100.0)).abs() < 1e-9);
+        assert!((penetration(&a, &cube([250.0, 0.0, 0.0], 0.0, 100.0)) + 50.0).abs() < 1e-9);
+        // A cube turned 45° reaches 141 m along x: at 240 m its edge is 1.4 m in.
+        let turned = cube([240.0, 0.0, 0.0], 45.0, 100.0);
+        assert!((penetration(&a, &turned) - (100.0 * 2f64.sqrt() - 140.0)).abs() < 1e-6);
+        assert!((turned.bounds().0[0] - (240.0 - 100.0 * 2f64.sqrt())).abs() < 1e-6);
+        // Diagonally apart: the bounds overlap along x and z, the turned cube's face separates them.
+        let far = cube([175.0, 0.0, 175.0], 45.0, 100.0);
+        assert!((penetration(&a, &far) - (100.0 * 2f64.sqrt() + 100.0 - 175.0 * 2f64.sqrt())).abs() < 1e-6);
+    }
+
+    fn shape(position: [f64; 3], half_extents: [f64; 3]) -> ShapeBox {
+        ShapeBox { transform: Transform { position, rotation: Quat::IDENTITY }, half_extents }
+    }
+
+    #[test]
+    fn triangles_cross_only_through_their_insides() {
+        let t = [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]];
+        // A triangle standing through t's middle crosses it; one beside it, or only
+        // touching its edge, or lying in its plane, doesn't.
+        assert!(triangles_cross(&t, &[[2.0, 2.0, -5.0], [2.0, 2.0, 5.0], [4.0, 2.0, 5.0]]));
+        assert!(!triangles_cross(&t, &[[20.0, 2.0, -5.0], [20.0, 2.0, 5.0], [22.0, 2.0, 5.0]]));
+        assert!(!triangles_cross(&t, &[[2.0, 2.0, 0.0], [2.0, 2.0, 5.0], [4.0, 2.0, 5.0]]), "a corner on t: touching");
+        assert!(!triangles_cross(&t, &[[1.0, 1.0, 0.0], [3.0, 1.0, 0.0], [1.0, 3.0, 0.0]]), "coplanar");
+    }
+
+    #[test]
+    fn module_overlap_uses_the_deepest_box_pair() {
+        // A 200 m block with a thin spire on top (y 100..500), and a block with an arm.
+        let spired = [shape([0.0; 3], [100.0; 3]), shape([0.0, 300.0, 0.0], [10.0, 200.0, 10.0])];
+        let armed = [shape([0.0; 3], [100.0; 3]), shape([-230.0, 300.0, 0.0], [40.0, 10.0, 10.0])];
+        let at = |boxes: &[ShapeBox], x: f64| Body::new(boxes, &[], &Transform { position: [x, 0.0, 0.0], ..Transform::IDENTITY });
+        // Side by side, touching: no overlap; 0.5 m in: within the tolerance; 30 m in: overlap.
+        assert_eq!(overlap(&at(&spired, 0.0), &at(&spired, 200.0)), None);
+        assert_eq!(overlap(&at(&spired, 0.0), &at(&spired, 199.5)), None);
+        assert!((overlap(&at(&spired, 0.0), &at(&spired, 170.0)).unwrap() - 30.0).abs() < 1e-9);
+        // 250 m apart the blocks are clear, but the arm (x -20..60) crosses the spire (x -10..10).
+        assert!((overlap(&at(&spired, 0.0), &at(&armed, 250.0)).unwrap() - 20.0).abs() < 1e-9);
+        assert_eq!(overlap(&at(&spired, 0.0), &at(&armed, 290.0)), None, "the arm ends at x 20, clear of the spire");
+        // Joined at a snap (facing each other), modules may interlock.
+        let snap = |x: f64, yaw: f64| Snap { name: "s".to_owned(), transform: Transform { position: [x, 0.0, 0.0], rotation: Quat::axis_angle(Axis::Y, yaw) } };
+        let joined = |x: f64, s: f64, yaw: f64| Body::new(&spired, &[snap(s, yaw)], &Transform { position: [x, 0.0, 0.0], ..Transform::IDENTITY });
+        assert_eq!(overlap(&joined(0.0, 85.0, 90.0), &joined(170.0, -85.0, -90.0)), None);
+        assert!(overlap(&joined(0.0, 85.0, 90.0), &joined(170.0, -80.0, -90.0)).is_some(), "5 m apart is not joined");
+        assert!(overlap(&joined(0.0, 85.0, 90.0), &joined(170.0, -85.0, 90.0)).is_some(), "facing the same way is not joined");
+    }
+}

@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>X4 Station Designer</title>
+  </head>
+  <body>
+    <header id="toolbar">
+      <button id="btn-new" title="Start an empty design">New</button>
+      <button id="btn-open-game" title="Open one of your saved plans or import files">Open game plan…</button>
+      <button id="btn-open-file" title="Open a plan file">Open file…</button>
+      <button id="btn-save" title="Save the design to a plan file">Save as…</button>
+      <button id="btn-export" class="primary" title="Write into the game's import folder">Export to game</button>
+      <span class="sep"></span>
+      <button id="btn-undo" title="Undo (Ctrl+Z)">Undo</button>
+      <button id="btn-redo" title="Redo (Ctrl+Y)">Redo</button>
+      <button id="btn-frame" title="Fit the view (F)">Fit view</button>
+      <label class="toggle" title="Show the game's textures on the models (more memory and loading time)"><input type="checkbox" id="textures" /> Textures</label>
+      <select id="quality" title="Model detail: Fast is lighter for big stations">
+        <option value="fast">Fast</option>
+        <option value="normal" selected>Normal</option>
+        <option value="detailed">Detailed</option>
+      </select>
+      <select id="max-fps" title="Frame rate limit while the view moves: lower uses less GPU (an idle view draws nothing anyway)">
+        <option value="30">30 fps</option>
+        <option value="60" selected>60 fps</option>
+        <option value="120">120 fps</option>
+        <option value="144">144 fps</option>
+        <option value="0">Screen fps</option>
+      </select>
+      <span class="sep"></span>
+      <input id="design-name" spellcheck="false" title="Plan name (also the import file name)" />
+      <span id="dirty" hidden title="Changes since the last save or export">● unsaved</span>
+      <span id="patches"></span>
+    </header>
+    <main>
+      <aside id="palette">
+        <div class="tabs">
+          <button id="tab-modules" class="on">Modules</button>
+          <button id="tab-order">Build order</button>
+          <button id="tab-planner">Planner</button>
+        </div>
+        <div id="modules-tab" class="tab">
+          <input id="search" placeholder="Search modules…" spellcheck="false" />
+          <select id="class-filter"><option value="">All categories</option></select>
+          <div id="race-filter" class="chips" title="Show modules of these races (none selected: all)"></div>
+          <label id="bp-toggle" title="Read a save to find the modules the player has blueprints for, and offer only those (here and in the planner). Off: every module."><input type="checkbox" id="bp-on" /> Only modules I have blueprints for</label>
+          <div id="bp-info" hidden><span id="bp-save"></span> <button id="bp-other" title="Read the blueprints from another save">Other save…</button> <button id="bp-reread" title="Read this save again (e.g. after buying blueprints and saving)">Re-read</button></div>
+          <div id="module-list"></div>
+          <div id="module-count"></div>
+        </div>
+        <div id="order-tab" class="tab" hidden>
+          <label class="step">Show up to step <input type="range" id="build-step" min="0" value="0" /> <span id="build-step-label"></span></label>
+          <div class="order-find">
+            <input id="order-search" placeholder="Find in build order…" spellcheck="false" autocomplete="off" title="Highlights the modules whose name or macro has every typed word. Enter selects the next one and zooms to it, Shift+Enter the previous; Esc clears." />
+            <span id="order-search-count"></span>
+          </div>
+          <div id="order-list"></div>
+          <p class="hint">Modules are built top to bottom, each after the one it attaches to. Drag a row onto another to move it. Shift-click a second row to select the range, then drag them together; they stop at the closest step that order allows. The wheel scrolls the list while you drag. Double-click a row to zoom to it.</p>
+        </div>
+        <div id="planner-tab" class="tab" hidden>
+          <div class="planner-add">
+            <div class="ware-search">
+              <input id="planner-ware" placeholder="Ware to make…" spellcheck="false" autocomplete="off" title="Type part of a name; arrow keys and Enter (or a click) add it" />
+              <div id="planner-ware-list" class="search-list" hidden></div>
+            </div>
+            <input type="number" id="planner-count" min="1" value="1" title="Production modules for it" />
+            <button id="planner-add">Add</button>
+          </div>
+          <ul id="planner-targets"></ul>
+          <div class="planner-add">
+            <div class="ware-search">
+              <input id="planner-module" placeholder="Other module (defence, storage, ship bay, dock…)" spellcheck="false" autocomplete="off" title="Defence, storage, ship-building modules, piers or dock areas to add as they are, e.g. defence platforms, extra storage, ship fabrication or maintenance bays, a pier or dock area of your choice (instead of the planner's own); their workforce is housed like the rest. Wares to make go in the box above. Only the race chosen below is listed, plus universal modules (no race, like Generic in the palette). Type part of a name; arrow keys and Enter (or a click) add it" />
+              <div id="planner-module-list" class="search-list" hidden></div>
+            </div>
+            <input type="number" id="planner-module-count" min="1" value="1" title="How many" />
+            <button id="planner-module-add">Add</button>
+          </div>
+          <ul id="planner-extras"></ul>
+          <label>Race <select id="planner-race" title="Use this race's modules where it has them"><option value="">Any</option></select></label>
+          <label><span>House the workforce</span> <input type="checkbox" id="planner-workforce" checked title="Add habitats and make their food and medicine" /></label>
+          <label>Storage hours <input type="number" id="planner-hours" min="0" max="48" step="1" value="6" title="Hours of the station's production and consumption the storage should hold" /></label>
+          <label>Storage at least <span class="storage-min"><input id="planner-store-container" placeholder="container" spellcheck="false" title="Container storage the station has at least, in m³: e.g. 1M, 500k or 250000; empty for none" /><input id="planner-store-solid" placeholder="solid" spellcheck="false" title="Solid storage the station has at least, in m³: e.g. 1M, 500k; empty for none" /><input id="planner-store-liquid" placeholder="liquid/gas" spellcheck="false" title="Liquid storage (gases too) the station has at least, in m³: e.g. 200k; empty for none" /></span></label>
+          <div id="planner-buy" class="chips"></div>
+          <button id="planner-generate" class="primary">Generate plan</button>
+          <button id="planner-optimize" title="Plan the modules that fix the open station's shortfalls (the settings above, no wares) for you to trim; Apply plan then adds them. With Rebuild connection structures, it also re-lays the station out in layers: those without turret/shield slots in the middle, defensible ones around them, docks and piers outside with a clear approach.">Optimize station</button>
+          <label><span>Rebuild connection structures</span> <input type="checkbox" id="optimize-rebuild" title="Off: Place all and Apply plan add the modules at free snaps; the station's modules move only when nothing else fits (a connection hub goes into a joint). On: they lay the whole station out again in layers with the new modules and rebuild its connection structures." /></label>
+          <label><span>Fewer connection structures</span> <input type="checkbox" id="planner-fewer" title="Place all and Optimize add a connection structure only when it brings a module 4 km nearer the centre (instead of 2 km): about half as many, for less in-game load, but a larger station" /></label>
+          <div id="planner-warning" hidden></div>
+          <div id="planner-summary" class="details"></div>
+          <button id="planner-place" hidden title="Attach every module still to place at free snaps, clear of each other, adding connection structures where needed (one undo step)">Place all</button>
+          <button id="planner-apply" class="primary" hidden title="Add these modules, then fit the plot to the station. With Rebuild connection structures, the station is re-laid out in layers too (equipment stays; nothing changes if something has no room).">Apply plan</button>
+          <div id="planner-placed"></div>
+          <div id="planner-result"></div>
+          <p class="hint">Adds to the open design: what it already has counts. With no wares it fixes the station's shortfalls. Click a row to place that module, or Place all.</p>
+        </div>
+      </aside>
+      <section id="viewport"></section>
+      <aside id="inspector">
+        <section id="armed-panel" hidden>
+          <h3 id="armed-title">Placing</h3>
+          <div id="armed-name" class="name"></div>
+          <label>Connect by snap <select id="armed-snap"></select></label>
+          <label>Twist <select id="armed-twist"></select></label>
+          <label>Rotation step <select class="rot-step" title="Twist and rotation steps, in degrees"><option>90</option><option>45</option><option>30</option><option>15</option><option>5</option></select></label>
+          <button id="btn-place-root">Place as first module</button>
+          <p class="hint">Hover a free snap (cone) to preview, click or drop to attach. C / Shift+C cycles the connecting snap, T / Shift+T the twist; when moving, the module's own snaps are orange cones to click. Esc cancels.</p>
+        </section>
+        <section id="selection-panel" hidden>
+          <h3>Selected</h3>
+          <div id="sel-name" class="name"></div>
+          <div id="sel-details" class="details"></div>
+          <div class="row">
+            <button id="btn-twist-left" title="Twist -90° (Shift+R)">⟲ 90°</button>
+            <button id="btn-twist-right" title="Twist +90° (R)">⟳ 90°</button>
+            <button id="btn-remove" class="danger" title="Remove it alone; what is attached to it stays where it is, unattached (Del)">Remove</button>
+            <button id="btn-remove-sequence" class="danger" title="Remove it with everything attached to it (Shift+Del)">Remove sequence</button>
+          </div>
+          <label id="sel-snap-row" hidden>Connected by <select id="sel-snap" title="Which of its snaps joins the module it is attached to; it stays on the same spot with the same twist (C / Shift+C)"></select></label>
+          <div id="sel-position" class="pos-grid" hidden title="Where the free-standing module sits, in metres from the station origin (game coordinates); everything attached to it moves along">
+            <label>X <input type="number" step="10" data-axis="0" /></label>
+            <label>Y <input type="number" step="10" data-axis="1" /></label>
+            <label>Z <input type="number" step="10" data-axis="2" /></label>
+          </div>
+          <label>Rotation step <select class="rot-step" title="Twist and rotation steps, in degrees"><option>90</option><option>45</option><option>30</option><option>15</option><option>5</option></select></label>
+          <div class="row" id="gizmo-row" hidden>
+            <button id="btn-gizmo-mode" title="Rotate gizmo: turn the module (and everything on it); an attached module turns about its joint and stays attached">Rotate</button>
+            <button id="btn-straighten" title="Take the tilt off: line its snap up with the one it attaches to again, keeping the twist" hidden>Straighten</button>
+          </div>
+          <div class="row order-actions">
+            <button id="btn-move" title="Move it (with everything attached) onto another free snap">Move…</button>
+            <button id="btn-copy-sequence" title="Copy it with everything attached onto free snaps (Ctrl+Shift+C, Shift+middle click). Ctrl+C or a middle click copies just the module.">Copy sequence…</button>
+            <button id="btn-detach" title="Make it free-standing where it is">Detach</button>
+          </div>
+          <div class="row order-actions">
+            <button id="btn-build-first" title="Build it first (Page Up): it becomes the root, and the modules between it and the old root hang on it instead (nothing moves)">Build first</button>
+            <button id="btn-build-last" title="Build it as late as possible (Page Down), with everything attached to it">Build last</button>
+          </div>
+          <label><span>A build stage ends here</span> <input type="checkbox" id="stage-end" /></label>
+          <div id="sel-equipment" class="collapsed" hidden>
+            <h4>Equipment</h4>
+            <div id="sel-equipment-groups"></div>
+            <div class="row">
+              <button id="btn-equip-same" title="Give every module of this type the same equipment">Apply to all of this type</button>
+              <button id="btn-equip-all" title="Use this module's turrets and shields on every module where they fit">Apply to all modules</button>
+            </div>
+          </div>
+        </section>
+        <section id="equipment-panel" class="collapsed">
+          <h3>Station equipment</h3>
+          <div id="equip-summary" class="details"></div>
+          <label>Loadout level
+            <select id="equip-level" title="Our own picks per group: fitting non-missile equipment of the module's race, cheapest (low) to most expensive (high)">
+              <option value="none">None</option><option value="low">Low</option><option value="medium">Medium</option><option value="high" selected>High</option>
+            </select>
+            <button id="btn-equip-level">Apply</button>
+          </label>
+          <label>M turret <select id="pick-turrets-medium"></select></label>
+          <label>M shield <select id="pick-shields-medium"></select></label>
+          <label>L turret <select id="pick-turrets-large"></select></label>
+          <label>L shield <select id="pick-shields-large"></select></label>
+          <button id="btn-equip-picks" title="Put these on every group where they fit (one undo step)">Equip station</button>
+          <label><span>Defence modules only</span> <input type="checkbox" id="equip-defence-only" /></label>
+        </section>
+        <section id="cost-panel" class="collapsed">
+          <h3 id="cost-title">Build cost</h3>
+          <label>Build method <select id="build-method" title="The game's Preferred Build Method"></select></label>
+          <table id="cost-lines"></table>
+          <div id="cost-total" class="details"></div>
+        </section>
+        <section id="economy-panel" class="collapsed">
+          <h3>Production</h3>
+          <label>Sector <select id="sector" title="The sector the station goes in: its sunlight from the game files"><option value="">Any (type the sunlight %)</option></select></label>
+          <label>Sunlight % <input type="number" id="sunlight" min="0" max="1000" step="5" title="The sector's sunlight: solar output (energy cells) follows it" /></label>
+          <div id="economy-summary" class="details"></div>
+          <table id="economy-flows"></table>
+          <div id="economy-storage" class="details"></div>
+          <ul id="economy-notes"></ul>
+        </section>
+        <section id="load-panel" class="collapsed">
+          <h3>In-game load</h3>
+          <div id="load-summary" class="details"></div>
+          <div class="details" title="Players' rules of thumb; nothing here is measured in game">Fewer modules (connection structures make nothing), turrets and docks, and a smaller station, likely cost less frame rate. Not measured in game.</div>
+        </section>
+        <section id="plot-panel" class="collapsed">
+          <h3>Plot</h3>
+          <div id="plot-summary" class="details"></div>
+          <div class="plot-grid">
+            <label>+X <input type="number" min="0" max="20" step="1" data-side="pos" data-axis="0" /></label>
+            <label>−X <input type="number" min="0" max="20" step="1" data-side="neg" data-axis="0" /></label>
+            <label>+Y <input type="number" min="0" max="20" step="1" data-side="pos" data-axis="1" /></label>
+            <label>−Y <input type="number" min="0" max="20" step="1" data-side="neg" data-axis="1" /></label>
+            <label>+Z <input type="number" min="0" max="20" step="1" data-side="pos" data-axis="2" /></label>
+            <label>−Z <input type="number" min="0" max="20" step="1" data-side="neg" data-axis="2" /></label>
+          </div>
+          <button id="btn-fit-plot" title="Smallest plot that holds the station">Fit plot to station</button>
+        </section>
+        <section id="checks-panel" class="collapsed">
+          <h3>Checks <span id="issue-count"></span></h3>
+          <ul id="issues"></ul>
+        </section>
+        <section class="help">
+          <p>Left drag, Q/E or arrow keys: rotate · Right drag: pan · W/S: forward/back · A/D: left/right · Z/X: down/up · Wheel: zoom · Shift: 3× faster<br />Click a module to select · Right click: its menu · Middle click / Ctrl+C: copy (with Shift: the sequence) · Del removes (Shift+Del: the sequence) · R twists · C connecting snap (T twist while placing)</p>
+        </section>
+      </aside>
+    </main>
+    <div id="update" hidden><span id="update-text"></span> <button id="update-download" class="primary">Download</button> <button id="update-skip">Skip this version</button></div>
+    <footer id="status">Loading game data…</footer>
+    <div id="module-menu" hidden>
+      <button id="menu-copy">Copy <kbd>Ctrl+C</kbd></button>
+      <button id="menu-copy-sequence">Copy sequence <kbd>Ctrl+Shift+C</kbd></button>
+      <hr />
+      <button id="menu-remove" class="danger">Remove <kbd>Del</kbd></button>
+      <button id="menu-remove-sequence" class="danger">Remove sequence <kbd>Shift+Del</kbd></button>
+      <hr />
+      <button id="menu-move">Move…</button>
+      <button id="menu-detach">Detach</button>
+    </div>
+    <div id="modal" hidden><div class="dialog"><h3 id="modal-title"></h3><div id="modal-body"></div><button id="modal-close">Cancel</button></div></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

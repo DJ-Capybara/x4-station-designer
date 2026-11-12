@@ -1,0 +1,1167 @@
+//! Editing a plan: the operations the builder, the CLI and MCP share (D-7, D-8).
+//!
+//! Every operation keeps the plan valid by construction: attached modules are
+//! placed with the snap math, moving or twisting a module carries everything
+//! attached to it along, and removing a module removes its descendants (or,
+//! removed alone, leaves them unattached) and renumbers the entries `1..n` like
+//! the game writes them.
+//!
+//! Entry order is the build order: a module always comes after the module it
+//! attaches to. `bookmark="1"` on an entry ends a build stage (see
+//! docs/x4-construction-plans.md, "Build order and stages").
+
+use std::sync::Arc;
+
+use crate::catalog::{Catalog, Module, Snap};
+use crate::equipment::{choose, exact, module_groups, Choice, Fill};
+use crate::geometry::{attach as attach_transform, Axis, Quat, Transform};
+use crate::import::new_plan_id;
+use crate::plan::{Entry, Plan, Predecessor, Upgrade};
+use crate::plot::{required_plot, Plot};
+use crate::{Error, Result};
+
+pub struct Design {
+    plan: Plan,
+    undo: Vec<Plan>,
+    redo: Vec<Plan>,
+    /// The plot the station must fit in. Not part of the plan file (the game keeps
+    /// plots per station), and not undone with edits.
+    plot: Option<Plot>,
+    /// The plan as last saved, exported or opened: unsaved changes are differences from it.
+    saved: Plan,
+}
+
+/// A snap point of a placed module that nothing uses, in the station frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreeSnap {
+    pub name: String,
+    pub world: Transform,
+}
+
+impl Design {
+    /// An empty design on a plot reaching 2 km on every side (4×4×4 km), the game's default.
+    pub fn new(name: &str) -> Design {
+        let mut design = Design::from_plan(Plan {
+            id: new_plan_id(),
+            name: name.to_owned(),
+            description: Some(String::new()),
+            tags: None,
+            useplanname: None,
+            fixed: None,
+            patches: Vec::new(),
+            entries: Vec::new(),
+        });
+        design.plot = Some(Plot::around(2));
+        design
+    }
+
+    /// A design for an existing plan, without a plot (see `fit_plot`).
+    pub fn from_plan(plan: Plan) -> Design {
+        Design { saved: plan.clone(), plan, undo: Vec::new(), redo: Vec::new(), plot: None }
+    }
+
+    /// Whether the plan differs from what was last saved, exported or opened
+    /// (undoing back to that state counts as unchanged).
+    pub fn is_dirty(&self) -> bool {
+        self.plan != self.saved
+    }
+
+    /// Call after writing the plan somewhere (plan file or the game's import folder).
+    pub fn mark_saved(&mut self) {
+        self.saved = self.plan.clone();
+    }
+
+    pub fn plot(&self) -> Option<Plot> {
+        self.plot
+    }
+
+    pub fn set_plot(&mut self, plot: Option<Plot>) -> Result<()> {
+        if plot.is_some_and(|p| !p.is_allowed()) {
+            return Err(Error("a plot is 1 to 20 km along each axis".to_owned()));
+        }
+        self.plot = plot;
+        Ok(())
+    }
+
+    /// Sets the plot to the smallest that holds the station, or with `grow_only`
+    /// enlarges the current plot just enough. Fails when no plot can hold it.
+    pub fn fit_plot(&mut self, catalog: &Catalog, grow_only: bool) -> Result<Plot> {
+        let required = required_plot(&self.plan, catalog).unwrap_or(Plot::around(1));
+        let plot = match (grow_only, self.plot) {
+            (true, Some(current)) => current.union(&required),
+            _ => required,
+        };
+        if !plot.is_allowed() {
+            return Err(Error(format!("the station needs {required}; plots are at most 20 km per axis")));
+        }
+        self.plot = Some(plot);
+        Ok(plot)
+    }
+
+    pub fn plan(&self) -> &Plan {
+        &self.plan
+    }
+
+    pub fn rename(&mut self, name: &str) {
+        self.checkpoint();
+        self.plan.name = name.to_owned();
+    }
+
+    /// Gives the plan another id (it becomes another plan in the game), in every
+    /// undo and redo state too, so undoing an edit never brings the old id back.
+    pub fn set_id(&mut self, id: &str) {
+        for plan in std::iter::once(&mut self.plan).chain(&mut self.undo).chain(&mut self.redo) {
+            plan.id = id.to_owned();
+        }
+    }
+
+    /// Places a module on its own (not attached to anything) at `at`.
+    pub fn add_root(&mut self, catalog: &Catalog, macro_name: &str, at: Transform) -> Result<u32> {
+        let module = catalog.module(macro_name)?;
+        self.checkpoint();
+        let index = self.next_index();
+        self.plan.entries.push(new_entry(index, &module, None, at));
+        self.plan.patches = catalog.required_patches(&self.plan);
+        Ok(index)
+    }
+
+    /// Attaches a new module by its snap `snap` to snap `to_snap` of entry `to`,
+    /// twisted by `twist_degrees` around the snap axis.
+    pub fn attach(
+        &mut self,
+        catalog: &Catalog,
+        macro_name: &str,
+        snap: &str,
+        to: u32,
+        to_snap: &str,
+        twist_degrees: f64,
+    ) -> Result<u32> {
+        let module = catalog.module(macro_name)?;
+        let child_snap = find_snap(&module, snap)?;
+        let pred_snap = find_snap(&catalog.module(&self.entry(to)?.macro_name)?, to_snap)?;
+        if self.snap_in_use(to, &pred_snap.name) {
+            return Err(Error(format!("snap {} of entry {to} is already in use", pred_snap.name)));
+        }
+        let at = attach_transform(&self.world(to)?, &pred_snap.transform, &child_snap.transform, twist_degrees);
+        self.checkpoint();
+        let index = self.next_index();
+        let link = (child_snap.name.clone(), Predecessor { index: to, connection: pred_snap.name.clone() });
+        self.plan.entries.push(new_entry(index, &module, Some(link), at));
+        self.plan.patches = catalog.required_patches(&self.plan);
+        Ok(index)
+    }
+
+    /// Re-attaches entry `index` to its predecessor with a new twist; everything
+    /// attached to it moves along. A tilt (see `rotate_attached`) is kept.
+    pub fn set_twist(&mut self, catalog: &Catalog, index: u32, twist_degrees: f64) -> Result<()> {
+        let (joint, child_snap) = self.joint(catalog, index)?;
+        let tilt = tilt_of(&joint, &self.world(index)?, &child_snap);
+        let target = at_joint(&joint, tilt, &child_snap, twist_degrees);
+        self.checkpoint();
+        self.move_subtree(index, &target);
+        Ok(())
+    }
+
+    /// Turns attached entry `index`, with everything attached to it, about its
+    /// joint (where its snap meets its predecessor's) to the station-frame
+    /// `rotation`. It stays linked: a turn around the snap axis is a twist, any
+    /// other turn tilts it off the snap axis, which the game's build menu never does.
+    pub fn rotate_attached(&mut self, catalog: &Catalog, index: u32, rotation: Quat) -> Result<()> {
+        let (joint, child_snap) = self.joint(catalog, index)?;
+        let rotation = rotation.normalized();
+        let offset = rotation.rotate(child_snap.position);
+        let target = Transform { position: [0, 1, 2].map(|i| joint.position[i] - offset[i]), rotation };
+        self.checkpoint();
+        self.move_subtree(index, &target);
+        Ok(())
+    }
+
+    /// Takes the tilt off attached entry `index` (its snap axis lines up with its
+    /// predecessor's again), keeping its twist; everything attached to it moves along.
+    pub fn straighten(&mut self, catalog: &Catalog, index: u32) -> Result<()> {
+        let (joint, child_snap) = self.joint(catalog, index)?;
+        let twist = crate::geometry::fit(&joint, &Transform::IDENTITY, &self.world(index)?, &child_snap).twist;
+        let target = at_joint(&joint, Quat::IDENTITY, &child_snap, twist);
+        self.checkpoint();
+        self.move_subtree(index, &target);
+        Ok(())
+    }
+
+    /// Where attached entry `index` joins its predecessor: the predecessor's snap
+    /// frame in the station frame, and the entry's own snap (module frame).
+    fn joint(&self, catalog: &Catalog, index: u32) -> Result<(Transform, Transform)> {
+        let e = self.entry(index)?;
+        let (Some(conn), Some(pred)) = (&e.connection, &e.predecessor) else {
+            return Err(Error(format!("entry {index} is not attached to anything; move it instead")));
+        };
+        let child_snap = find_snap(&catalog.module(&e.macro_name)?, conn)?;
+        let pred_snap = find_snap(&catalog.module(&self.entry(pred.index)?.macro_name)?, &pred.connection)?;
+        Ok((self.world(pred.index)?.then(&pred_snap.transform), child_snap.transform))
+    }
+
+    /// Moves an attached or free-standing module, with everything attached to it,
+    /// so its snap `snap` connects to snap `to_snap` of entry `to`, twisted by
+    /// `twist_degrees`. The target can't be the module itself or attached to it.
+    /// If `to` comes later in the build order, the moved modules are re-sequenced
+    /// right after it. Returns the module's (possibly new) index.
+    pub fn reattach(&mut self, catalog: &Catalog, index: u32, snap: &str, to: u32, to_snap: &str, twist_degrees: f64) -> Result<u32> {
+        let moved = self.subtree(index);
+        if moved.contains(&to) {
+            return Err(Error(format!("module {index} can't attach to itself or to a module attached to it")));
+        }
+        let entry = self.entry(index)?;
+        let child_snap = find_snap(&catalog.module(&entry.macro_name)?, snap)?;
+        let pred_snap = find_snap(&catalog.module(&self.entry(to)?.macro_name)?, to_snap)?;
+        let current_link = entry.predecessor.as_ref().is_some_and(|p| p.index == to && p.connection.eq_ignore_ascii_case(&pred_snap.name));
+        if self.snap_in_use(to, &pred_snap.name) && !current_link {
+            return Err(Error(format!("snap {} of entry {to} is already in use", pred_snap.name)));
+        }
+        let used_by_children = self.plan.entries.iter().any(|e| {
+            e.predecessor.as_ref().is_some_and(|p| p.index == index && p.connection.eq_ignore_ascii_case(&child_snap.name))
+        });
+        if used_by_children {
+            return Err(Error(format!("snap {} of module {index} holds an attached module", child_snap.name)));
+        }
+        let target = attach_transform(&self.world(to)?, &pred_snap.transform, &child_snap.transform, twist_degrees);
+        self.checkpoint();
+        self.move_subtree(index, &target);
+        let e = self.plan.entries.iter_mut().find(|e| e.index == index).unwrap();
+        e.connection = Some(child_snap.name.clone());
+        e.predecessor = Some(Predecessor { index: to, connection: pred_snap.name.clone() });
+        // Keep the build order valid: the moved modules come after their new parent.
+        let order = self.order_after(&moved, to);
+        let new_index = order.iter().position(|&i| i == index).unwrap() as u32 + 1;
+        self.sort_and_renumber(&order);
+        Ok(new_index)
+    }
+
+    /// Puts a new module (`macro_name`, e.g. a connection hub) between attached
+    /// entry `child` and its predecessor: its snap `in_snap` takes the predecessor's
+    /// snap, twisted `twist_degrees`, and `child` with everything attached to it
+    /// moves onto its snap `out_snap`, twisted `child_twist`. The new module comes
+    /// right before `child` in the build order. Returns its index and the entries
+    /// renumbered by that: (old index, new index).
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_between(
+        &mut self,
+        catalog: &Catalog,
+        child: u32,
+        macro_name: &str,
+        in_snap: &str,
+        twist_degrees: f64,
+        out_snap: &str,
+        child_twist: f64,
+    ) -> Result<(u32, Vec<(u32, u32)>)> {
+        let e = self.entry(child)?;
+        let (Some(conn), Some(pred)) = (e.connection.clone(), e.predecessor.clone()) else {
+            return Err(Error(format!("entry {child} is not attached to anything")));
+        };
+        let module = catalog.module(macro_name)?;
+        let (inner, outer) = (find_snap(&module, in_snap)?, find_snap(&module, out_snap)?);
+        let pred_snap = find_snap(&catalog.module(&self.entry(pred.index)?.macro_name)?, &pred.connection)?;
+        let child_snap = find_snap(&catalog.module(&e.macro_name)?, &conn)?;
+        let at = attach_transform(&self.world(pred.index)?, &pred_snap.transform, &inner.transform, twist_degrees);
+        let child_at = attach_transform(&at, &outer.transform, &child_snap.transform, child_twist);
+        self.checkpoint();
+        let index = self.next_index();
+        self.plan.entries.push(new_entry(index, &module, Some((inner.name.clone(), pred)), at));
+        self.entry_mut(child).predecessor = Some(Predecessor { index, connection: outer.name.clone() });
+        self.move_subtree(child, &child_at);
+        let mut order: Vec<u32> = self.plan.entries.iter().map(|e| e.index).filter(|&i| i != index).collect();
+        let before = order.iter().position(|&i| i == child).unwrap_or(order.len());
+        order.insert(before, index);
+        let renumbered: Vec<(u32, u32)> = order.iter().zip(1..).filter(|(old, new)| *old != new).map(|(&old, new)| (old, new)).collect();
+        let new_index = before as u32 + 1;
+        self.sort_and_renumber(&order);
+        self.plan.patches = catalog.required_patches(&self.plan);
+        Ok((new_index, renumbered))
+    }
+
+    /// Makes an attached module free-standing where it is (its link is dropped;
+    /// whatever is attached to it stays attached).
+    pub fn detach(&mut self, index: u32) -> Result<()> {
+        if self.entry(index)?.predecessor.is_none() {
+            return Err(Error(format!("module {index} is not attached to anything")));
+        }
+        self.checkpoint();
+        let e = self.plan.entries.iter_mut().find(|e| e.index == index).unwrap();
+        e.connection = None;
+        e.predecessor = None;
+        Ok(())
+    }
+
+    /// The current order with `moved` placed right after `after` when they came
+    /// before it; otherwise unchanged.
+    fn order_after(&self, moved: &[u32], after: u32) -> Vec<u32> {
+        let current: Vec<u32> = self.plan.entries.iter().map(|e| e.index).collect();
+        let first_moved = current.iter().position(|i| moved.contains(i)).unwrap_or(0);
+        let parent = current.iter().position(|&i| i == after).unwrap_or(0);
+        if parent < first_moved {
+            return current;
+        }
+        let rest: Vec<u32> = current.iter().copied().filter(|i| !moved.contains(i)).collect();
+        let cut = rest.iter().position(|&i| i == after).map_or(rest.len(), |p| p + 1);
+        let block: Vec<u32> = current.iter().copied().filter(|i| moved.contains(i)).collect();
+        [&rest[..cut], &block[..], &rest[cut..]].concat()
+    }
+
+    /// Moves an unattached module, and everything attached to it, to `at`.
+    pub fn move_root(&mut self, index: u32, at: Transform) -> Result<()> {
+        if self.entry(index)?.predecessor.is_some() {
+            return Err(Error(format!("entry {index} is attached; change its twist or remove it instead")));
+        }
+        self.checkpoint();
+        self.move_subtree(index, &at);
+        Ok(())
+    }
+
+    /// Removes entry `index` and every module attached to it, directly or not,
+    /// then renumbers the rest `1..n`. Returns how many entries were removed.
+    pub fn remove(&mut self, catalog: &Catalog, index: u32) -> Result<usize> {
+        self.entry(index)?;
+        let doomed = self.subtree(index);
+        self.checkpoint();
+        self.plan.entries.retain(|e| !doomed.contains(&e.index));
+        self.renumber();
+        self.plan.patches = catalog.required_patches(&self.plan);
+        Ok(doomed.len())
+    }
+
+    /// Removes entry `index` alone, like the game's *Remove*: the modules attached
+    /// to it stay where they are, unattached (each keeps what is attached to it).
+    /// The rest is renumbered `1..n`.
+    pub fn remove_single(&mut self, catalog: &Catalog, index: u32) -> Result<()> {
+        self.entry(index)?;
+        self.checkpoint();
+        self.plan.entries.retain(|e| e.index != index);
+        for e in self.plan.entries.iter_mut().filter(|e| e.predecessor.as_ref().is_some_and(|p| p.index == index)) {
+            e.connection = None;
+            e.predecessor = None;
+        }
+        self.renumber();
+        self.plan.patches = catalog.required_patches(&self.plan);
+        Ok(())
+    }
+
+    /// Copies entry `index` and everything attached to it (its sequence, with
+    /// equipment, in build order) so the copy's snap `snap` connects to snap
+    /// `to_snap` of entry `to`, twisted by `twist_degrees`. The copies go to the end
+    /// of the build order, without stage ends. Returns the copy's index.
+    pub fn copy_sequence(&mut self, catalog: &Catalog, index: u32, snap: &str, to: u32, to_snap: &str, twist_degrees: f64) -> Result<u32> {
+        let sequence = self.subtree(index);
+        let child_snap = find_snap(&catalog.module(&self.entry(index)?.macro_name)?, snap)?;
+        let pred_snap = find_snap(&catalog.module(&self.entry(to)?.macro_name)?, to_snap)?;
+        if self.snap_in_use(to, &pred_snap.name) {
+            return Err(Error(format!("snap {} of entry {to} is already in use", pred_snap.name)));
+        }
+        let used_by_children = self.plan.entries.iter().any(|e| {
+            e.predecessor.as_ref().is_some_and(|p| p.index == index && p.connection.eq_ignore_ascii_case(&child_snap.name))
+        });
+        if used_by_children {
+            return Err(Error(format!("snap {} of module {index} holds an attached module", child_snap.name)));
+        }
+        let target = attach_transform(&self.world(to)?, &pred_snap.transform, &child_snap.transform, twist_degrees);
+        let delta = target.then(&self.world(index)?.inverse());
+        let first = self.next_index();
+        let copies: Vec<Entry> = self.plan.entries.iter().filter(|e| sequence.contains(&e.index)).cloned().collect();
+        let new_index = |old: u32| first + copies.iter().position(|e| e.index == old).unwrap() as u32;
+        let copies: Vec<Entry> = copies
+            .iter()
+            .map(|e| {
+                let (connection, predecessor) = if e.index == index {
+                    (Some(child_snap.name.clone()), Some(Predecessor { index: to, connection: pred_snap.name.clone() }))
+                } else {
+                    let p = e.predecessor.as_ref().unwrap();
+                    (e.connection.clone(), Some(Predecessor { index: new_index(p.index), connection: p.connection.clone() }))
+                };
+                Entry {
+                    index: new_index(e.index),
+                    connection,
+                    predecessor,
+                    bookmark: None,
+                    offset: Some(delta.then(&Transform::from_offset(e.offset.as_ref())).to_offset()),
+                    ..e.clone()
+                }
+            })
+            .collect();
+        self.checkpoint();
+        self.plan.entries.extend(copies);
+        self.plan.patches = catalog.required_patches(&self.plan);
+        Ok(first)
+    }
+
+    /// Moves entry `index` to `position` (1-based) in the build order. Fails when
+    /// that would put it before the module it attaches to, or after a module
+    /// attached to it. Entries are renumbered to the new order; returns the
+    /// module's new index.
+    pub fn move_in_build_order(&mut self, index: u32, position: usize) -> Result<u32> {
+        let from = self.position_of(index)?;
+        if position == 0 || position > self.plan.entries.len() {
+            return Err(Error(format!("position {position} is outside 1..{}", self.plan.entries.len())));
+        }
+        let mut order: Vec<u32> = self.plan.entries.iter().map(|e| e.index).collect();
+        order.remove(from);
+        order.insert(position - 1, index);
+        self.apply_order(&order)?;
+        Ok(position as u32)
+    }
+
+    /// Moves `indices` as one block so `anchor` (one of them) lands at `position`
+    /// (1-based). The others keep their order around it, and the block stays
+    /// inside the list. Dropping onto one of the moved modules changes nothing.
+    ///
+    /// A module still has to be built after the one it attaches to. When `position`
+    /// would break that, the block goes to the closest step that doesn't (toward
+    /// the requested step when two are equally close). If that step is the one it
+    /// already has, nothing changes and no undo step is recorded. Returns
+    /// `anchor`'s index afterwards (modules are renumbered when the order changes).
+    pub fn move_block_in_build_order(&mut self, indices: &[u32], anchor: u32, position: usize) -> Result<u32> {
+        if indices.is_empty() {
+            return Err(Error("no modules to move".into()));
+        }
+        let order_now: Vec<u32> = self.plan.entries.iter().map(|e| e.index).collect();
+        if let Some(&missing) = indices.iter().find(|i| !order_now.contains(i)) {
+            return Err(Error(format!("no entry {missing}")));
+        }
+        let n = order_now.len();
+        if position == 0 || position > n {
+            return Err(Error(format!("position {position} is outside 1..{n}")));
+        }
+        let moving: Vec<u32> = order_now.iter().copied().filter(|i| indices.contains(i)).collect();
+        if !moving.contains(&anchor) {
+            return Err(Error(format!("module {anchor} is not one of the modules being moved")));
+        }
+        // The row under the pointer is already in the block: leave the order alone.
+        if moving.contains(&order_now[position - 1]) {
+            return Ok(anchor);
+        }
+        let offset = moving.iter().position(|&i| i == anchor).unwrap();
+        let k = moving.len();
+        // `anchor` can't sit so close to either end that the rest of the block falls off.
+        let min_pos = offset + 1;
+        let max_pos = n - k + offset + 1;
+        let ideal = position.clamp(min_pos, max_pos);
+        // Prefer the side the pointer asked for when two legal steps are the same distance away.
+        let prefer_lower = position <= ideal;
+        let remaining: Vec<u32> = order_now.iter().copied().filter(|i| !moving.contains(i)).collect();
+        for dist in 0..=(max_pos - min_pos) {
+            let mut slots = [None, None];
+            if dist == 0 {
+                slots[0] = Some(ideal);
+            } else if prefer_lower {
+                slots[0] = ideal.checked_sub(dist).filter(|&p| p >= min_pos);
+                slots[1] = ideal.checked_add(dist).filter(|&p| p <= max_pos);
+            } else {
+                slots[0] = ideal.checked_add(dist).filter(|&p| p <= max_pos);
+                slots[1] = ideal.checked_sub(dist).filter(|&p| p >= min_pos);
+            }
+            for landed in slots.into_iter().flatten() {
+                let insert_at = landed - offset - 1;
+                let mut order = Vec::with_capacity(n);
+                order.extend_from_slice(&remaining[..insert_at]);
+                order.extend_from_slice(&moving);
+                order.extend_from_slice(&remaining[insert_at..]);
+                if self.predecessor_violation(&order).is_some() {
+                    continue;
+                }
+                if order == order_now {
+                    return Ok(anchor);
+                }
+                self.apply_order(&order)?;
+                return Ok(landed as u32);
+            }
+        }
+        // No contiguous placement keeps the attachments (a non-contiguous set can
+        // do this). Leave the order as it is.
+        Ok(anchor)
+    }
+
+    /// Builds entry `index` first: the links from it to its root are reversed, so
+    /// it becomes the root and that chain hangs on it (offsets don't change). The
+    /// chain follows it in its new order; the rest keep theirs. Returns 1.
+    pub fn build_first(&mut self, index: u32) -> Result<u32> {
+        let mut chain = vec![index];
+        while let Some(p) = &self.entry(*chain.last().unwrap())?.predecessor {
+            chain.push(p.index);
+        }
+        self.checkpoint();
+        let mut links = Vec::new();
+        for &i in &chain {
+            let e = self.entry_mut(i);
+            links.push((i, e.connection.take(), e.predecessor.take()));
+        }
+        for (child, connection, predecessor) in links {
+            if let Some(p) = predecessor {
+                let parent = self.entry_mut(p.index);
+                parent.connection = Some(p.connection);
+                parent.predecessor = connection.map(|c| Predecessor { index: child, connection: c });
+            }
+        }
+        let rest = self.plan.entries.iter().map(|e| e.index).filter(|i| !chain.contains(i));
+        let order: Vec<u32> = chain.iter().copied().chain(rest).collect();
+        self.sort_and_renumber(&order);
+        Ok(1)
+    }
+
+    /// Builds entry `index` as late as possible: it and everything attached to
+    /// it move to the end, keeping their order; the rest keep theirs. Returns
+    /// the module's new index.
+    pub fn build_last(&mut self, index: u32) -> Result<u32> {
+        self.entry(index)?;
+        let moved = self.subtree(index);
+        let (tail, head): (Vec<u32>, Vec<u32>) = self.plan.entries.iter().map(|e| e.index).partition(|i| moved.contains(i));
+        let new_index = head.len() + tail.iter().position(|&i| i == index).unwrap() + 1;
+        self.apply_order(&[head, tail].concat())?;
+        Ok(new_index as u32)
+    }
+
+    /// Marks entry `index` as the last of a build stage (`bookmark="1"`), or not.
+    pub fn set_stage_end(&mut self, index: u32, end: bool) -> Result<()> {
+        self.entry(index)?;
+        self.checkpoint();
+        let e = self.plan.entries.iter_mut().find(|e| e.index == index).unwrap();
+        e.bookmark = end.then(|| "1".to_owned());
+        Ok(())
+    }
+
+    /// Equips one kind of slot (`turrets` or `shields`) in a group of entry `index`:
+    /// `Some((macro, count))` puts `count` of that equipment on its slots (it must fit
+    /// all of them), `None` removes what is there.
+    pub fn set_equipment(&mut self, catalog: &Catalog, index: u32, group: &str, kind: &str, equip: Option<(&str, u32)>) -> Result<()> {
+        let module = catalog.module(&self.entry(index)?.macro_name)?;
+        let slots: Vec<_> = module.group_slots(group, kind).collect();
+        if slots.is_empty() {
+            return Err(Error(format!("module {index} ({}) has no {kind} in group {group}", module.macro_name)));
+        }
+        let group = slots[0].group.clone();
+        let choice = match equip {
+            Some((macro_name, count)) => {
+                let e = catalog
+                    .equipment()?
+                    .iter()
+                    .find(|e| e.macro_name.eq_ignore_ascii_case(macro_name))
+                    .ok_or_else(|| Error(format!("{macro_name} is not buildable equipment")))?;
+                if !slots.iter().all(|s| e.fits(s)) {
+                    return Err(Error(format!("{macro_name} doesn't fit the {kind} of group {group}")));
+                }
+                if count == 0 || count as usize > slots.len() {
+                    return Err(Error(format!("group {group} has {} {kind} slots; {count} can't go there", slots.len())));
+                }
+                Some((e.macro_name.clone(), count, slots.len() as u32))
+            }
+            None => None,
+        };
+        self.checkpoint();
+        put_upgrade(&mut self.entry_mut(index).upgrades, &group, kind, choice);
+        Ok(())
+    }
+
+    /// Equips every group of the given entries as `fill` chooses, as one undo step.
+    /// Returns how many group slots of a kind were filled, cleared and skipped
+    /// (nothing fits).
+    pub fn equip_modules(&mut self, catalog: &Catalog, indices: &[u32], fill: &Fill) -> Result<(usize, usize, usize)> {
+        let equipment = catalog.equipment()?;
+        let mut changes = Vec::new();
+        let (mut filled, mut cleared, mut skipped) = (0, 0, 0);
+        for &index in indices {
+            let e = self.entry(index)?;
+            let module = catalog.module(&e.macro_name)?;
+            for slots in module_groups(equipment, &module, &e.upgrades) {
+                match choose(catalog, &module, &slots, fill)? {
+                    Choice::Fill(m) => {
+                        filled += 1;
+                        changes.push((index, slots.group, slots.kind, Some((m, slots.slots, slots.slots))));
+                    }
+                    Choice::Clear => {
+                        cleared += 1;
+                        changes.push((index, slots.group, slots.kind, None));
+                    }
+                    Choice::Skip => skipped += 1,
+                }
+            }
+        }
+        if !changes.is_empty() {
+            self.checkpoint();
+            for (index, group, kind, choice) in changes {
+                put_upgrade(&mut self.entry_mut(index).upgrades, &group, kind, choice);
+            }
+        }
+        Ok((filled, cleared, skipped))
+    }
+
+    /// Gives every other module of the same type the equipment of entry `index`, as
+    /// one undo step. Returns how many modules changed.
+    pub fn copy_equipment(&mut self, index: u32) -> Result<usize> {
+        let source = self.entry(index)?.clone();
+        let targets: Vec<u32> = self
+            .plan
+            .entries
+            .iter()
+            .filter(|e| e.index != index && e.macro_name.eq_ignore_ascii_case(&source.macro_name) && e.upgrades != source.upgrades)
+            .map(|e| e.index)
+            .collect();
+        if !targets.is_empty() {
+            self.checkpoint();
+            for t in &targets {
+                self.entry_mut(*t).upgrades = source.upgrades.clone();
+            }
+        }
+        Ok(targets.len())
+    }
+
+    fn position_of(&self, index: u32) -> Result<usize> {
+        self.plan.entries.iter().position(|e| e.index == index).ok_or_else(|| Error(format!("no entry {index}")))
+    }
+
+    /// `(module, the module it attaches to)` when `order` would build one first.
+    fn predecessor_violation(&self, order: &[u32]) -> Option<(u32, u32)> {
+        let rank = |i: u32| order.iter().position(|&o| o == i);
+        for e in &self.plan.entries {
+            if let Some(p) = &e.predecessor {
+                if rank(p.index) > rank(e.index) {
+                    return Some((e.index, p.index));
+                }
+            }
+        }
+        None
+    }
+
+    /// Reorders the entries to `order` (current indices) if every module still
+    /// comes after its predecessor, then renumbers them `1..n`.
+    fn apply_order(&mut self, order: &[u32]) -> Result<()> {
+        if let Some((module, predecessor)) = self.predecessor_violation(order) {
+            return Err(Error(format!("module {module} would be built before {predecessor}, which it attaches to")));
+        }
+        self.checkpoint();
+        self.sort_and_renumber(order);
+        Ok(())
+    }
+
+    /// Puts the entries in `order` (current indices) and renumbers them `1..n`.
+    fn sort_and_renumber(&mut self, order: &[u32]) {
+        let rank = |i: u32| order.iter().position(|&o| o == i);
+        let mut entries = std::mem::take(&mut self.plan.entries);
+        entries.sort_by_key(|e| rank(e.index));
+        self.plan.entries = entries;
+        self.renumber();
+    }
+
+    /// Snaps of entry `index` that nothing uses, where new modules can attach.
+    pub fn free_snaps(&self, catalog: &Catalog, index: u32) -> Result<Vec<FreeSnap>> {
+        let world = self.world(index)?;
+        let module = catalog.module(&self.entry(index)?.macro_name)?;
+        Ok(module
+            .snaps
+            .iter()
+            .filter(|s| !self.snap_in_use(index, &s.name))
+            .map(|s| FreeSnap { name: s.name.clone(), world: world.then(&s.transform) })
+            .collect())
+    }
+
+    /// Station-frame transform of entry `index`.
+    pub fn world(&self, index: u32) -> Result<Transform> {
+        Ok(Transform::from_offset(self.entry(index)?.offset.as_ref()))
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(previous) = self.undo.pop() else { return false };
+        self.redo.push(std::mem::replace(&mut self.plan, previous));
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo.pop() else { return false };
+        self.undo.push(std::mem::replace(&mut self.plan, next));
+        true
+    }
+
+    /// How many edits can be undone.
+    pub fn history_len(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// Turns the edits made since the history had `since` steps into one undo step.
+    pub fn squash_history(&mut self, since: usize) {
+        self.undo.truncate(since + 1);
+    }
+
+    fn checkpoint(&mut self) {
+        self.undo.push(self.plan.clone());
+        self.redo.clear();
+    }
+
+    fn entry(&self, index: u32) -> Result<&Entry> {
+        self.plan.entries.iter().find(|e| e.index == index).ok_or_else(|| Error(format!("no entry {index}")))
+    }
+
+    /// Gives entry `index` this equipment as it is (no checks, no undo step of its
+    /// own): for auto-placement, which puts a lifted dock back with its equipment.
+    pub(crate) fn restore_upgrades(&mut self, index: u32, upgrades: Vec<Upgrade>) {
+        self.entry_mut(index).upgrades = upgrades;
+    }
+
+    /// Entry `index`, which the caller has checked exists.
+    fn entry_mut(&mut self, index: u32) -> &mut Entry {
+        self.plan.entries.iter_mut().find(|e| e.index == index).unwrap()
+    }
+
+    fn next_index(&self) -> u32 {
+        self.plan.entries.iter().map(|e| e.index).max().unwrap_or(0) + 1
+    }
+
+    /// Whether snap `snap` of entry `index` links it to its predecessor or holds a child.
+    fn snap_in_use(&self, index: u32, snap: &str) -> bool {
+        self.plan.entries.iter().any(|e| {
+            (e.index == index && e.connection.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(snap)))
+                || e.predecessor.as_ref().is_some_and(|p| p.index == index && p.connection.eq_ignore_ascii_case(snap))
+        })
+    }
+
+    /// `index` and all entries attached to it, directly or not.
+    fn subtree(&self, index: u32) -> Vec<u32> {
+        let mut found = vec![index];
+        let mut i = 0;
+        while i < found.len() {
+            let parent = found[i];
+            found.extend(self.plan.entries.iter().filter(|e| e.predecessor.as_ref().is_some_and(|p| p.index == parent)).map(|e| e.index));
+            i += 1;
+        }
+        found
+    }
+
+    /// Moves entry `index` to `target`, carrying its subtree rigidly. `index` must exist.
+    fn move_subtree(&mut self, index: u32, target: &Transform) {
+        let current = Transform::from_offset(self.plan.entries.iter().find(|e| e.index == index).and_then(|e| e.offset.as_ref()));
+        let delta = target.then(&current.inverse());
+        let moved = self.subtree(index);
+        for e in self.plan.entries.iter_mut().filter(|e| moved.contains(&e.index)) {
+            e.offset = Some(delta.then(&Transform::from_offset(e.offset.as_ref())).to_offset());
+        }
+    }
+
+    /// Entries become `1..n` in their current order; predecessor links follow.
+    fn renumber(&mut self) {
+        let map: Vec<(u32, u32)> = self.plan.entries.iter().zip(1..).map(|(e, n)| (e.index, n)).collect();
+        let new_index = |old: u32| map.iter().find(|(o, _)| *o == old).map_or(old, |(_, n)| *n);
+        for e in &mut self.plan.entries {
+            e.index = new_index(e.index);
+            if let Some(p) = &mut e.predecessor {
+                p.index = new_index(p.index);
+            }
+        }
+    }
+}
+
+fn find_snap(module: &Arc<Module>, name: &str) -> Result<Snap> {
+    module.snap(name).cloned().ok_or_else(|| Error(format!("{} has no snap {name}", module.macro_name)))
+}
+
+/// Sets (or with `None` removes) the equipment of one kind in a group: (macro,
+/// count, slots). A replaced upgrade keeps its place and `path`.
+fn put_upgrade(upgrades: &mut Vec<Upgrade>, group: &str, kind: &str, choice: Option<(String, u32, u32)>) {
+    let at = upgrades.iter().position(|u| u.kind == kind && u.group.eq_ignore_ascii_case(group));
+    let old = at.map(|i| upgrades.remove(i));
+    if let Some((macro_name, count, slots)) = choice {
+        let new = Upgrade {
+            kind: kind.to_owned(),
+            macro_name,
+            path: old.and_then(|o| o.path),
+            group: group.to_owned(),
+            exact: exact(kind, count, slots),
+        };
+        upgrades.insert(at.unwrap_or(upgrades.len()), new);
+    }
+}
+
+/// A module at a joint (its predecessor's snap frame): its snap meets the joint's
+/// point, facing it, tilted by `tilt` (in the joint's frame) and twisted around
+/// its own snap axis. With no tilt this is `geometry::attach`.
+fn at_joint(joint: &Transform, tilt: Quat, child_snap: &Transform, twist_degrees: f64) -> Transform {
+    let snap = joint.rotation * tilt * Quat::axis_angle(Axis::Y, 180.0) * Quat::axis_angle(Axis::Z, twist_degrees);
+    let rotation = snap * child_snap.rotation.conj();
+    let offset = rotation.rotate(child_snap.position);
+    Transform { position: [0, 1, 2].map(|i| joint.position[i] - offset[i]), rotation }
+}
+
+/// The tilt of a module at `world` attached by `child_snap` at `joint`: the part of
+/// its turn (in the joint's frame) that isn't around the snap axis (swing-twist
+/// decomposition about Z). Identity for a straight joint.
+fn tilt_of(joint: &Transform, world: &Transform, child_snap: &Transform) -> Quat {
+    let snap = world.then(child_snap).rotation;
+    let q = joint.rotation.conj() * snap * Quat::axis_angle(Axis::Y, 180.0).conj();
+    let n = (q.w * q.w + q.z * q.z).sqrt();
+    if n < 1e-9 {
+        return q; // flipped right over: all tilt
+    }
+    q * Quat { w: q.w / n, x: 0.0, y: 0.0, z: q.z / n }.conj()
+}
+
+fn new_entry(index: u32, module: &Arc<Module>, link: Option<(String, Predecessor)>, at: Transform) -> Entry {
+    let (connection, predecessor) = link.map_or((None, None), |(c, p)| (Some(c), Some(p)));
+    Entry {
+        index,
+        macro_name: module.macro_name.clone(),
+        connection,
+        bookmark: None,
+        fixed: None,
+        predecessor,
+        offset: Some(at.to_offset()),
+        upgrades: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::{fit, Axis, Quat};
+
+    fn snap(name: &str, position: [f64; 3], yaw: f64) -> Snap {
+        Snap { name: name.to_owned(), transform: Transform { position, rotation: Quat::axis_angle(Axis::Y, yaw) } }
+    }
+
+    /// A straight 800 m beam (like struct_arg_base_02) and a cross with four side snaps.
+    fn catalog() -> Catalog {
+        let module = |name: &str, snaps| Module {
+            macro_name: name.to_owned(),
+            class: "connectionmodule".to_owned(),
+            component: name.to_owned(),
+            source: None,
+            snaps,
+            shape: Vec::new(),
+            parts: Vec::new(),
+            collision: Vec::new(),
+            equipment_slots: Vec::new(),
+            clearance: Vec::new(),
+            economy: Default::default(),
+        };
+        Catalog::from_modules(vec![
+            module("beam", vec![snap("s1", [0.0, 0.0, 400.0], 0.0), snap("s2", [0.0, 0.0, -400.0], 180.0)]),
+            module("cross", vec![
+                snap("n", [0.0, 0.0, 200.0], 0.0),
+                snap("s", [0.0, 0.0, -200.0], 180.0),
+                snap("e", [200.0, 0.0, 0.0], 90.0),
+                snap("w", [-200.0, 0.0, 0.0], -90.0),
+            ]),
+        ])
+    }
+
+    fn close(a: [f64; 3], b: [f64; 3]) -> bool {
+        (0..3).all(|i| (a[i] - b[i]).abs() < 1e-3)
+    }
+
+    fn assert_attached(d: &Design, c: &Catalog, index: u32) {
+        let e = d.plan().entries.iter().find(|e| e.index == index).unwrap();
+        let p = e.predecessor.as_ref().unwrap();
+        let ps = c.module(&d.plan().entries.iter().find(|x| x.index == p.index).unwrap().macro_name).unwrap();
+        let cs = c.module(&e.macro_name).unwrap();
+        let f = fit(&d.world(p.index).unwrap(), &ps.snap(&p.connection).unwrap().transform,
+                    &d.world(index).unwrap(), &cs.snap(e.connection.as_ref().unwrap()).unwrap().transform);
+        assert!(f.gap < 1e-3 && f.misalignment < 1e-3, "entry {index}: {f:?}");
+    }
+
+    #[test]
+    fn attach_places_modules_on_snaps() {
+        let c = catalog();
+        let mut d = Design::new("test");
+        let root = d.add_root(&c, "beam", Transform::IDENTITY).unwrap();
+        let cross = d.attach(&c, "cross", "s", root, "s1", 0.0).unwrap();
+        assert!(close(d.world(cross).unwrap().position, [0.0, 0.0, 600.0]));
+        let side = d.attach(&c, "beam", "s2", cross, "e", 0.0).unwrap();
+        assert!(close(d.world(side).unwrap().position, [600.0, 0.0, 600.0]));
+        assert_attached(&d, &c, cross);
+        assert_attached(&d, &c, side);
+        assert_eq!(d.free_snaps(&c, cross).unwrap().iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["n", "w"]);
+        assert!(d.attach(&c, "beam", "s2", cross, "e", 0.0).is_err(), "snap e is taken");
+    }
+
+    #[test]
+    fn twist_carries_descendants() {
+        let c = catalog();
+        let mut d = Design::new("test");
+        let root = d.add_root(&c, "beam", Transform::IDENTITY).unwrap();
+        let cross = d.attach(&c, "cross", "s", root, "s1", 0.0).unwrap();
+        let side = d.attach(&c, "beam", "s2", cross, "e", 0.0).unwrap();
+        d.set_twist(&c, cross, 90.0).unwrap();
+        // The cross turned 90° around the beam axis (Z): its east arm, and the side
+        // beam on it, moved from (600, 0, 600) to (0, ±600, 600).
+        let p = d.world(side).unwrap().position;
+        assert!(p[0].abs() < 1e-3 && (p[1].abs() - 600.0).abs() < 1e-3 && (p[2] - 600.0).abs() < 1e-3, "{p:?}");
+        assert_attached(&d, &c, cross);
+        assert_attached(&d, &c, side);
+    }
+
+    #[test]
+    fn tilt_keeps_the_joint_and_survives_twists() {
+        let c = catalog();
+        let mut d = Design::new("test");
+        let root = d.add_root(&c, "beam", Transform::IDENTITY).unwrap();
+        let cross = d.attach(&c, "cross", "s", root, "s1", 0.0).unwrap();
+        let side = d.attach(&c, "beam", "s2", cross, "e", 0.0).unwrap();
+        let measure = |d: &Design| {
+            let s = c.module("cross").unwrap().snap("s").unwrap().transform;
+            fit(&d.world(root).unwrap(), &c.module("beam").unwrap().snap("s1").unwrap().transform, &d.world(cross).unwrap(), &s)
+        };
+        // Tilt the cross 30° about x: its snap point stays on the beam's, the axis is 30° off
+        // (within f32 rounding of the stored offsets).
+        let tilted = Quat::axis_angle(Axis::X, 30.0) * d.world(cross).unwrap().rotation;
+        d.rotate_attached(&c, cross, tilted).unwrap();
+        let f = measure(&d);
+        assert!(f.gap < 1e-3 && (f.misalignment - 30.0).abs() < 1e-3, "{f:?}");
+        assert_attached(&d, &c, side); // what hangs on it moved along
+        // A twist keeps the tilt; straightening keeps the twist.
+        d.set_twist(&c, cross, 90.0).unwrap();
+        let f = measure(&d);
+        assert!(f.gap < 1e-3 && (f.misalignment - 30.0).abs() < 1e-3 && (f.twist - 90.0).abs() < 1e-3, "{f:?}");
+        d.straighten(&c, cross).unwrap();
+        let f = measure(&d);
+        assert!(f.gap < 1e-3 && f.misalignment < 1e-3 && (f.twist - 90.0).abs() < 1e-3, "{f:?}");
+        assert_attached(&d, &c, cross);
+        assert_attached(&d, &c, side);
+        assert!(d.rotate_attached(&c, root, Quat::IDENTITY).is_err(), "the root isn't attached");
+    }
+
+    #[test]
+    fn move_root_carries_everything() {
+        let c = catalog();
+        let mut d = Design::new("test");
+        let root = d.add_root(&c, "beam", Transform::IDENTITY).unwrap();
+        let cross = d.attach(&c, "cross", "s", root, "s1", 0.0).unwrap();
+        let at = Transform { position: [1000.0, 0.0, 0.0], rotation: Quat::axis_angle(Axis::Y, 90.0) };
+        d.move_root(root, at).unwrap();
+        assert!(close(d.world(cross).unwrap().position, [1600.0, 0.0, 0.0]));
+        assert_attached(&d, &c, cross);
+        assert!(d.move_root(cross, at).is_err(), "attached modules move with their root");
+    }
+
+    /// 1 beam, 2 cross on it, 3 beam on the cross, 4 beam on beam 1's other end.
+    fn small_station(c: &Catalog) -> Design {
+        let mut d = Design::new("order");
+        let root = d.add_root(c, "beam", Transform::IDENTITY).unwrap();
+        let cross = d.attach(c, "cross", "s", root, "s1", 0.0).unwrap();
+        d.attach(c, "beam", "s2", cross, "e", 0.0).unwrap();
+        d.attach(c, "beam", "s1", root, "s2", 0.0).unwrap();
+        d
+    }
+
+    fn order(d: &Design) -> Vec<(u32, String, Option<u32>)> {
+        d.plan().entries.iter().map(|e| (e.index, e.macro_name.clone(), e.predecessor.as_ref().map(|p| p.index))).collect()
+    }
+
+    #[test]
+    fn build_order_moves_respect_attachments() {
+        let c = catalog();
+        let mut d = small_station(&c);
+        let placed = |d: &Design, macro_name: &str, pred: Option<u32>| {
+            d.plan().entries.iter().find(|e| e.macro_name == macro_name && e.predecessor.as_ref().map(|p| p.index) == pred).map(|e| e.index)
+        };
+        // Beam 4 hangs on the root: it may move to position 2, before the cross.
+        assert_eq!(d.move_in_build_order(4, 2).unwrap(), 2);
+        assert_eq!(order(&d)[1], (2, "beam".to_owned(), Some(1)), "{:?}", order(&d));
+        assert_eq!(placed(&d, "cross", Some(1)), Some(3));
+        // The cross can't go before the root it attaches to.
+        assert!(d.move_in_build_order(3, 1).is_err());
+        // Build last: the cross and the beam on it go to the end, renumbered.
+        assert_eq!(d.build_last(3).unwrap(), 3, "the cross is first of the moved pair");
+        assert_eq!(order(&d).iter().map(|o| o.0).collect::<Vec<_>>(), [1, 2, 3, 4]);
+        assert_eq!(order(&d)[2].1, "cross");
+        assert_eq!(order(&d)[3].2, Some(3), "the side beam still points at the cross");
+        // Build first: the side beam becomes the root; the cross hangs on it, the old
+        // root on the cross, and beam 2 still on the old root. Nothing moves.
+        let before: Vec<_> = d.plan().entries.iter().map(|e| e.offset.clone()).collect();
+        assert_eq!(d.build_first(4).unwrap(), 1);
+        assert_eq!(order(&d), [(1, "beam".to_owned(), None), (2, "cross".to_owned(), Some(1)), (3, "beam".to_owned(), Some(2)), (4, "beam".to_owned(), Some(3))]);
+        assert_eq!(d.plan().entries[0].connection, None);
+        let after: Vec<_> = d.plan().entries.iter().map(|e| e.offset.clone()).collect();
+        assert_eq!(after, [&before[3], &before[2], &before[0], &before[1]].map(Clone::clone));
+        for i in 2..=4 {
+            assert_attached(&d, &c, i);
+        }
+        assert!(d.undo());
+        assert_eq!(order(&d)[0], (1, "beam".to_owned(), None), "undo puts the old root back");
+        assert!(d.redo());
+        // Stages and undo.
+        d.set_stage_end(2, true).unwrap();
+        assert_eq!(d.plan().entries[1].bookmark.as_deref(), Some("1"));
+        assert!(d.undo());
+        assert_eq!(d.plan().entries[1].bookmark, None);
+    }
+
+    #[test]
+    fn build_order_block_moves_together() {
+        let c = catalog();
+        // 1 beam, 2 cross on it, 3 beam on the cross, 4 beam on beam 1's other end.
+        let mut d = small_station(&c);
+        let placed = order(&d);
+        let steps = d.history_len();
+        // Grab the beam on the cross (#3) and drop it on #4. The cross stays just
+        // above it; the other beam shifts up. One undo step.
+        assert_eq!(d.move_block_in_build_order(&[2, 3], 3, 4).unwrap(), 4);
+        assert_eq!(
+            order(&d),
+            [
+                (1, "beam".to_owned(), None),
+                (2, "beam".to_owned(), Some(1)),
+                (3, "cross".to_owned(), Some(1)),
+                (4, "beam".to_owned(), Some(3)),
+            ]
+        );
+        assert_eq!(d.history_len(), steps + 1);
+        assert!(d.undo());
+        assert_eq!(order(&d), placed);
+        // Grabbing the cross instead clamps it to step 3 (the beam on it needs the next step).
+        // Same order; the cross's new index is 3.
+        assert_eq!(d.move_block_in_build_order(&[3, 2], 2, 4).unwrap(), 3);
+        assert_eq!(order(&d)[2].1, "cross");
+        assert!(d.undo());
+        // Beam 4 hangs on the root. Dropping it on step 1 can't pass the root, so it
+        // lands on step 2, the closest legal step, as one undo step.
+        let steps = d.history_len();
+        assert_eq!(d.move_block_in_build_order(&[4], 4, 1).unwrap(), 2);
+        assert_eq!(order(&d)[1], (2, "beam".to_owned(), Some(1)));
+        assert_eq!(d.history_len(), steps + 1);
+        assert!(d.undo());
+        // The cross and the beam on it can't jump ahead of the root. The closest
+        // legal place is where they already are: nothing moves, no undo step.
+        let stayed = d.history_len();
+        assert_eq!(d.move_block_in_build_order(&[2, 3], 2, 1).unwrap(), 2);
+        assert_eq!(order(&d), placed);
+        assert_eq!(d.history_len(), stayed, "already as close as the attachments allow");
+        // A chunk dropped before the module it hangs on stops at the closest later step.
+        let mut chain = small_station(&c);
+        let snap = chain.free_snaps(&c, 4).unwrap()[0].name.clone();
+        assert_eq!(chain.attach(&c, "beam", "s2", 4, &snap, 0.0).unwrap(), 5);
+        let chain_steps = chain.history_len();
+        assert_eq!(chain.move_block_in_build_order(&[4, 5], 4, 1).unwrap(), 2);
+        assert_eq!(chain.history_len(), chain_steps + 1);
+        assert_eq!(
+            order(&chain),
+            [
+                (1, "beam".to_owned(), None),
+                (2, "beam".to_owned(), Some(1)),
+                (3, "beam".to_owned(), Some(2)),
+                (4, "cross".to_owned(), Some(1)),
+                (5, "beam".to_owned(), Some(4)),
+            ]
+        );
+        // Dropping onto a module in the block changes nothing.
+        assert_eq!(d.move_block_in_build_order(&[2, 3], 3, 2).unwrap(), 3);
+        assert_eq!(d.history_len(), stayed);
+        assert_eq!(order(&d), placed);
+        // One module: the same result as move_in_build_order.
+        let mut alone = small_station(&c);
+        assert_eq!(d.move_block_in_build_order(&[4], 4, 2).unwrap(), alone.move_in_build_order(4, 2).unwrap());
+        assert_eq!(order(&d), order(&alone));
+        assert!(d.move_block_in_build_order(&[], 1, 1).is_err());
+        assert!(d.move_block_in_build_order(&[2, 9], 2, 3).is_err());
+        assert!(d.move_block_in_build_order(&[2, 3], 4, 4).is_err());
+    }
+
+    #[test]
+    fn reattach_moves_subtree_and_keeps_order_valid() {
+        let c = catalog();
+        // 1 beam, 2 cross on it, 3 beam on the cross's east arm, 4 beam on beam 1's other end.
+        let mut d = small_station(&c);
+        // Move the cross (with beam 3 on it) to the end of beam 4: beam 4 comes later
+        // in the order, so the cross and beam 3 are re-sequenced after it.
+        let free_end = d.free_snaps(&c, 4).unwrap()[0].name.clone();
+        let new_index = d.reattach(&c, 2, "s", 4, &free_end, 0.0).unwrap();
+        assert_eq!(new_index, 3);
+        assert_eq!(order(&d).iter().map(|o| (o.1.as_str(), o.2)).collect::<Vec<_>>(),
+                   [("beam", None), ("beam", Some(1)), ("cross", Some(2)), ("beam", Some(3))]);
+        for i in 2..=4 {
+            assert_attached(&d, &c, i);
+        }
+        // Not onto itself or something attached to it.
+        assert!(d.reattach(&c, 3, "s", 4, "w", 0.0).is_err());
+        // Detach: the module stays where it is, free-standing.
+        let at = d.world(3).unwrap();
+        d.detach(3).unwrap();
+        assert!(d.plan().entries[2].predecessor.is_none() && d.world(3).unwrap() == at);
+        assert_attached(&d, &c, 4);
+        // Undo twice: back to the original station.
+        assert!(d.undo() && d.undo());
+        assert_eq!(order(&d), order(&small_station(&c)));
+    }
+
+    #[test]
+    fn dirty_tracks_changes_since_saved() {
+        let c = catalog();
+        let mut d = Design::new("dirty");
+        assert!(!d.is_dirty());
+        d.add_root(&c, "beam", Transform::IDENTITY).unwrap();
+        assert!(d.is_dirty());
+        d.mark_saved();
+        assert!(!d.is_dirty());
+        d.rename("other");
+        assert!(d.is_dirty());
+        d.undo();
+        assert!(!d.is_dirty(), "undoing back to the saved state counts as unchanged");
+    }
+
+    #[test]
+    fn remove_renumbers_and_undo_restores() {
+        let c = catalog();
+        let mut d = Design::new("test");
+        let root = d.add_root(&c, "beam", Transform::IDENTITY).unwrap();
+        let cross = d.attach(&c, "cross", "s", root, "s1", 0.0).unwrap();
+        d.attach(&c, "beam", "s2", cross, "e", 0.0).unwrap();
+        let other = d.attach(&c, "beam", "s1", root, "s2", 0.0).unwrap();
+        assert_eq!(other, 4);
+        let before = d.plan().clone();
+
+        assert_eq!(d.remove(&c, cross).unwrap(), 2);
+        let indices: Vec<u32> = d.plan().entries.iter().map(|e| e.index).collect();
+        assert_eq!(indices, [1, 2]);
+        assert_eq!(d.plan().entries[1].predecessor.as_ref().unwrap().index, 1);
+        assert_attached(&d, &c, 2);
+
+        assert!(d.undo());
+        assert_eq!(d.plan(), &before);
+        assert!(d.redo());
+        assert_eq!(d.plan().entries.len(), 2);
+    }
+
+    #[test]
+    fn remove_single_leaves_the_attached_modules_unattached() {
+        let c = catalog();
+        let mut d = small_station(&c);
+        let side = d.world(3).unwrap();
+        d.remove_single(&c, 2).unwrap();
+        assert_eq!(order(&d), [(1, "beam".to_owned(), None), (2, "beam".to_owned(), None), (3, "beam".to_owned(), Some(1))]);
+        assert_eq!(d.plan().entries[1].connection, None);
+        assert!(close(d.world(2).unwrap().position, side.position), "the side beam stays where it was");
+        assert_attached(&d, &c, 3);
+        use crate::validate::{validate, Issue};
+        assert_eq!(validate(d.plan(), &c), [Issue::Unattached { index: 2 }]);
+        assert!(d.undo());
+        assert_eq!(d.plan().entries.len(), 4);
+        assert_eq!(validate(d.plan(), &c), []);
+    }
+
+    #[test]
+    fn copy_sequence_copies_the_subtree_onto_a_snap() {
+        let c = catalog();
+        let mut d = small_station(&c);
+        d.set_stage_end(3, true).unwrap();
+        // The cross (at z 600) and the beam on its east side, copied onto the cross's own north snap.
+        assert_eq!(d.copy_sequence(&c, 2, "s", 2, "n", 0.0).unwrap(), 5);
+        assert_eq!(order(&d)[4..], [(5, "cross".to_owned(), Some(2)), (6, "beam".to_owned(), Some(5))]);
+        assert!(close(d.world(5).unwrap().position, [0.0, 0.0, 1000.0]));
+        assert!(close(d.world(6).unwrap().position, [600.0, 0.0, 1000.0]));
+        assert_attached(&d, &c, 5);
+        assert_attached(&d, &c, 6);
+        assert_eq!(d.plan().entries[5].bookmark, None, "stage ends aren't copied");
+        assert!(d.copy_sequence(&c, 2, "s", 1, "s1", 0.0).is_err(), "snap s1 of the root is taken");
+        assert!(d.copy_sequence(&c, 2, "e", 5, "w", 0.0).is_err(), "the cross's e snap holds the side beam");
+        assert!(d.undo());
+        assert_eq!(d.plan().entries.len(), 4);
+    }
+}
