@@ -1,0 +1,16 @@
+# Files extracted from the game or from mods: not ours to commit, and large
+research/extracted/
+__pycache__/
+
+# Rust build output
+target/
+
+# Frontend dependencies and build output
+ui/node_modules/
+ui/dist/
+
+# Tauri generated files
+crates/x4sd/gen/
+
+# Local build cache
+/buildCache/

@@ -1,0 +1,554 @@
+//! `x4sd mcp`: MCP server over stdio for AI agents (D-8). When the builder is
+//! running, every operation goes to the design open there (D-7, `link.rs`);
+//! otherwise the server keeps its own design (headless).
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
+use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use serde::Deserialize;
+use serde_json::json;
+use x4sd_core::catalog::Catalog;
+use x4sd_core::design::Design;
+use x4sd_core::game::find_game_dir;
+
+use crate::link::Client;
+use crate::ops::{self, Ctx, ModuleNames, Op};
+
+const INSTRUCTIONS: &str = "\
+Designs X4: Foundations station construction plans and puts them into the game.
+Workflow: list_modules to find module macros -> new_design (or open_design) -> add_module for the first \
+module -> free_snaps to see where modules can attach -> attach_module (snap to snap; twist rotates around \
+the snap axis, usually in 90 degree steps) -> validate_design -> export_design, then the player clicks \
+Import in the game's station build menu.
+Planning a working station (\"a staffed station with 100 solar panels\"): list_wares for ware ids (solar \
+panels are Energy Cell Production, ware energycells) -> plan_production with targets (ware + number of \
+production modules); it adds the production chain, habitats with their food and medicine, storage, a dock \
+area and a pier -> auto_place with from_plan (the same settings) attaches every module it lists, adding \
+connection structures where needed. Other modules (ship fabrication or maintenance bays, defence platforms, \
+extra docks) go in extra_modules, each with optional sides (front, back, left, right, top, bottom: the count is \
+spread over them, each module on the outside of the station on its side, placed last); storage takes minimum m³ \
+per type, e.g. {\"container\": 1000000, \"solid\": 500000, \"liquid\": 200000} (gases are liquid) -> validate_design (if the station outgrew its plot, tell the user and \
+fit_plot with grow_only) -> analyze_station to check (wares still short must be bought or mined) -> \
+build_cost for the materials. auto_place also takes a plain module list. Self-sufficient means every made ware is produced on \
+the station; raw materials (ore, ice, silicon, nividium, methane, helium, hydrogen, scrap metal: flows with \
+raw=true) are always brought in (mined or salvaged), never planned, so a self-sufficient station still lists \
+them as short (self_sufficient=true).
+Coordinates are metres in the station frame, Y up. Module indices are 1..n and are renumbered after \
+remove_module. Every edit can be undone with undo.
+Equipment: turrets and shields go on a module's groups (most production, storage and defence modules have \
+some; a typical group is 2 M turret slots + 1 M shield slot). module_equipment shows a module's groups with \
+what fits; set_equipment fills one group; equip_modules fills many at once, from picks (e.g. one M turret, \
+one M shield, one L turret, one L shield: each group takes the first that fits) or a loadout level \
+(none/low/medium/high); copy_equipment copies one module's equipment to its type or, as picks, to all. \
+list_equipment finds macros. build_cost includes equipment.
+Optimize: optimize_station fixes an existing station's shortfalls and re-lays it out in layers (non-defensible \
+modules inside, defensible outside, docks, piers, defence platforms and bays outermost); keep_shape keeps its connection structures. To let the user choose what is added: plan_production with no targets, show the modules, then optimize_station with the modules they keep (buying a ware instead: plan again with it in buy). Optimize fits the plot to the station.
+In-game load (frame rate): station_load counts what likely costs the game the most: modules (connection structures make nothing), turrets, docks and size. These are players' rules of thumb, not measured. For a lighter station: fewer_connectors on auto_place and optimize_station (fewer connection structures, a larger station), only the turrets needed, and no more docks than the trade needs.
+Clearance: piers, fabrication/maintenance bays and dock areas have exclusion zones (the space ships use to \
+dock or leave: XL 4x4 km, L 1.2x1.2 km, out to 100 km). validate_design reports modules in a zone (\"blocks the \
+approach of pier N\", \"blocks the exit of bay N\"); auto_place and optimize_station keep every zone clear.
+Overlaps: validate_design reports modules whose collision shapes intersect (modules joined at a snap may \
+interlock); auto_place never creates any. Only overlaps with a dock area, pier or fabrication bay are issues; others \
+come as notes (the game allows them, but avoid them: they look bad).
+Plot: a station must fit its plot (whole km per side from the station origin, at most 20 km per axis). \
+New designs start on a 4x4x4 km plot (2 km per side, the game's default), opened ones on the smallest that fits. validate_design reports modules \
+outside the plot and the size needed; set_plot / fit_plot change it (tell the user when the plot must grow).
+Build order: modules are built in index order, each after the module it attaches to. move_in_build_order, \
+build_first and build_last reorder (and renumber, so describe again); set_stage_end splits the build into stages.
+Moving: reattach_module moves a placed module (with everything on it) onto another free snap; detach_module \
+makes it free-standing; move_module moves free-standing ones.
+Blueprints: to use only modules the player can build, read_blueprints (their newest save, or one they name); \
+blueprint_filter turns that limit off or on again. The limit is shared with the builder's palette setting.
+If the X4 Station Designer builder window is open, all tools work on the design shown there and the \
+user sees every change live (builder_status tells which).";
+
+#[derive(Clone)]
+pub struct Server {
+    state: Arc<Mutex<State>>,
+    tool_router: ToolRouter<Server>,
+}
+
+struct State {
+    game_dir: Option<PathBuf>,
+    profile_dir: Option<PathBuf>,
+    /// Connection to a running builder, if any.
+    link: Option<Client>,
+    /// Own catalogue and design, used when no builder runs.
+    local: Option<(Catalog, ModuleNames)>,
+    design: Design,
+    blueprints: ops::Blueprints,
+}
+
+type ToolResult = Result<String, String>;
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ListModulesArgs {
+    /// Only this class: connectionmodule, production, storage, habitation, dockarea, pier, defencemodule, buildmodule, welfaremodule, processingmodule, ventureplatform, radar
+    class: Option<String>,
+    /// Only this race, e.g. argon, terran, teladi
+    race: Option<String>,
+    /// Text to look for in the display name or macro
+    search: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct MacroArgs {
+    /// Module macro, e.g. struct_arg_base_02_macro
+    r#macro: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct NameArgs {
+    name: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct FileArgs {
+    /// Path of a plan file (constructionplans.xml, an exported plan, or one saved by save_design)
+    file: String,
+    /// Plan name or id, when the file has several plans
+    plan: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct PlaceArgs {
+    /// Module macro, e.g. struct_ter_cross_01_macro
+    r#macro: String,
+    /// Position [x, y, z] in metres; default [0, 0, 0]
+    position: Option<[f64; 3]>,
+    /// Degrees around Y (up)
+    yaw: Option<f64>,
+    /// Degrees, game convention
+    pitch: Option<f64>,
+    /// Degrees, game convention
+    roll: Option<f64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AttachArgs {
+    /// Module macro to add
+    r#macro: String,
+    /// Snap of the new module to connect; default: its first snap
+    snap: Option<String>,
+    /// Index of the placed module to attach to
+    to: u32,
+    /// Free snap of that module (see free_snaps)
+    to_snap: String,
+    /// Rotation around the snap axis in degrees; default 0
+    twist: Option<f64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct IndexArgs {
+    /// Module index in the design
+    index: u32,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct TwistArgs {
+    index: u32,
+    /// Rotation around the snap axis in degrees
+    twist: f64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct MoveArgs {
+    /// Index of a module that is not attached to anything
+    index: u32,
+    position: [f64; 3],
+    yaw: Option<f64>,
+    pitch: Option<f64>,
+    roll: Option<f64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ExportArgs {
+    /// Give the plan a fresh id so the import adds a new plan instead of replacing one with the same id
+    new_id: Option<bool>,
+    /// Replace an existing import file of the same name
+    overwrite: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SaveArgs {
+    /// Where to write the plan file
+    file: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct PlotArgs {
+    /// Reach on the positive side of X, Y, Z in whole km
+    pos: [u32; 3],
+    /// Reach on the negative side of X, Y, Z in whole km
+    neg: [u32; 3],
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct FitPlotArgs {
+    /// Only enlarge the current plot (default: set it to the smallest that holds the station)
+    grow_only: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct MoveArgsOrder {
+    /// Module index
+    index: u32,
+    /// New 1-based position in the build order
+    position: usize,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ReattachArgs {
+    /// Module to move (everything attached to it moves along)
+    index: u32,
+    /// Index of the placed module to attach it to (not the module itself or one attached to it)
+    to: u32,
+    /// Free snap of that module (see free_snaps)
+    to_snap: String,
+    /// Snap of the moved module to connect; default: its current one, else its first
+    snap: Option<String>,
+    /// Rotation around the snap axis in degrees; default 0
+    twist: Option<f64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CostArgs {
+    /// Module index; omit for the whole station
+    index: Option<u32>,
+    /// Build method: default (Universal), terran, boron, ... (default: default)
+    method: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AnalyzeArgs {
+    /// The sector's sunlight in percent; solar output (energy cells) follows it (default 100)
+    sunlight: Option<f64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct StageArgs {
+    /// Module index
+    index: u32,
+    /// true: a build stage ends after this module
+    end: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ListEquipmentArgs {
+    /// turrets or shields
+    kind: Option<String>,
+    /// small, medium, large, extralarge (station modules use medium and large)
+    size: Option<String>,
+    /// Maker race, e.g. argon, terran, boron
+    race: Option<String>,
+    /// Text to look for in the name or macro
+    search: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SetEquipmentArgs {
+    /// Module index
+    index: u32,
+    /// Group name from module_equipment, e.g. group01
+    group: String,
+    /// turrets or shields
+    kind: String,
+    /// Equipment macro that fits the group (see module_equipment); omit to remove the equipment
+    r#macro: Option<String>,
+    /// How many of the group's slots of that kind to fill; default all
+    count: Option<u32>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CopyEquipmentArgs {
+    /// Module whose equipment to copy
+    from: u32,
+    /// same_type (default): an exact copy onto every module of the same type; all: its equipment macros as picks for every module
+    scope: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ReadBlueprintsArgs {
+    /// Path of a save file (<profile>\save\*.xml.gz); default: the newest save
+    save: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct BlueprintFilterArgs {
+    /// true: limit to the blueprints of the save read last; false: all modules; omit for the status
+    on: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct NoArgs {}
+
+#[tool_router]
+impl Server {
+    pub fn new(game_dir: Option<PathBuf>, profile_dir: Option<PathBuf>) -> Server {
+        let state = State { game_dir, profile_dir, link: None, local: None, design: Design::new("New station"), blueprints: Default::default() };
+        Server { state: Arc::new(Mutex::new(state)), tool_router: Self::tool_router() }
+    }
+
+    #[tool(description = "Whether a builder window is running: if so, all tools act on the design shown there, live.")]
+    fn builder_status(&self, Parameters(_): Parameters<NoArgs>) -> ToolResult {
+        let mut state = self.state.lock().unwrap();
+        if state.link.is_none() {
+            state.link = Client::connect();
+        }
+        Ok(json!({"builder": state.link.is_some()}).to_string())
+    }
+
+    #[tool(description = "List buildable station modules (base game, DLCs, enabled mods): macro, class, race, source, display name.")]
+    fn list_modules(&self, Parameters(a): Parameters<ListModulesArgs>) -> ToolResult {
+        self.run(Op::ListModules { class: a.class, race: a.race, search: a.search })
+    }
+
+    #[tool(description = "Read the player's blueprints from a save (default: the newest; about half a second) and limit the modules to the ones they can build: list_modules, and the modules plan_production, auto_place and optimize_station choose (production, habitats, storage, docks, connection structures). Modules named explicitly are still used. Wares that only modules without a blueprint make are listed by plan_production in no_blueprint. Returns on, save, modules (owned station modules) and station_modules (all).")]
+    fn read_blueprints(&self, Parameters(a): Parameters<ReadBlueprintsArgs>) -> ToolResult {
+        self.run(Op::ReadBlueprints { save: a.save })
+    }
+
+    #[tool(description = "The blueprint limit (see read_blueprints): on=false shows all modules again, on=true limits them to the save read last (without reading it again); no on: just the status. The builder's palette setting is the same limit.")]
+    fn blueprint_filter(&self, Parameters(a): Parameters<BlueprintFilterArgs>) -> ToolResult {
+        self.run(Op::BlueprintFilter { on: a.on })
+    }
+
+    #[tool(description = "A module's snap connections: name, position and facing direction in the module's own frame.")]
+    fn module_snaps(&self, Parameters(a): Parameters<MacroArgs>) -> ToolResult {
+        self.run(Op::ModuleSnaps { r#macro: a.r#macro })
+    }
+
+    #[tool(description = "Start a new, empty design (replaces the open one).")]
+    fn new_design(&self, Parameters(a): Parameters<NameArgs>) -> ToolResult {
+        self.run(Op::NewDesign { name: a.name })
+    }
+
+    #[tool(description = "Open a plan from a plan file for editing (replaces the open design).")]
+    fn open_design(&self, Parameters(a): Parameters<FileArgs>) -> ToolResult {
+        self.run(Op::OpenDesign { file: a.file, plan: a.plan })
+    }
+
+    #[tool(description = "The open design: id, name, DLC patches, and every module with index, macro, name, position, what it is attached to, and its free snaps.")]
+    fn describe_design(&self, Parameters(_): Parameters<NoArgs>) -> ToolResult {
+        self.run(Op::DescribeDesign)
+    }
+
+    #[tool(description = "Rename the open design.")]
+    fn rename_design(&self, Parameters(a): Parameters<NameArgs>) -> ToolResult {
+        self.run(Op::RenameDesign { name: a.name })
+    }
+
+    #[tool(description = "Place a module on its own (not attached), e.g. the first module of a station. Returns its index.")]
+    fn add_module(&self, Parameters(a): Parameters<PlaceArgs>) -> ToolResult {
+        self.run(Op::AddModule { r#macro: a.r#macro, position: a.position, yaw: a.yaw, pitch: a.pitch, roll: a.roll })
+    }
+
+    #[tool(description = "Add a module by connecting one of its snaps to a free snap of a placed module. Returns the new index.")]
+    fn attach_module(&self, Parameters(a): Parameters<AttachArgs>) -> ToolResult {
+        self.run(Op::AttachModule { r#macro: a.r#macro, snap: a.snap, to: a.to, to_snap: a.to_snap, twist: a.twist })
+    }
+
+    #[tool(description = "Rotate an attached module around its snap axis to an absolute twist (degrees). Everything attached to it moves along.")]
+    fn set_twist(&self, Parameters(a): Parameters<TwistArgs>) -> ToolResult {
+        self.run(Op::SetTwist { index: a.index, twist: a.twist })
+    }
+
+    #[tool(description = "Move a module that is not attached to anything (and everything attached to it).")]
+    fn move_module(&self, Parameters(a): Parameters<MoveArgs>) -> ToolResult {
+        self.run(Op::MoveModule { index: a.index, position: a.position, yaw: a.yaw, pitch: a.pitch, roll: a.roll })
+    }
+
+    #[tool(description = "Remove a module and everything attached to it. The remaining modules are renumbered 1..n.")]
+    fn remove_module(&self, Parameters(a): Parameters<IndexArgs>) -> ToolResult {
+        self.run(Op::RemoveModule { index: a.index })
+    }
+
+    #[tool(description = "Free snaps of a placed module, where new modules can attach: name, station-frame position and facing direction.")]
+    fn free_snaps(&self, Parameters(a): Parameters<IndexArgs>) -> ToolResult {
+        self.run(Op::FreeSnaps { index: a.index })
+    }
+
+    #[tool(description = "Undo the last edit.")]
+    fn undo(&self, Parameters(_): Parameters<NoArgs>) -> ToolResult {
+        self.run(Op::Undo)
+    }
+
+    #[tool(description = "Redo the last undone edit.")]
+    fn redo(&self, Parameters(_): Parameters<NoArgs>) -> ToolResult {
+        self.run(Op::Redo)
+    }
+
+    #[tool(description = "Check the open design for problems the game does not catch (unknown modules, modules off their snaps, overlapping modules, missing DLC patches, modules outside the plot). An empty issues list means it is fine; notes (overlaps the game allows) are not problems.")]
+    fn validate_design(&self, Parameters(_): Parameters<NoArgs>) -> ToolResult {
+        self.run(Op::ValidateDesign)
+    }
+
+    #[tool(description = "Save the open design to a plan file (single-plan format, like the game's exports). A renamed plan becomes a new plan: if the player's plans have its id under another name, it gets a new id (new_plan: true).")]
+    fn save_design(&self, Parameters(a): Parameters<SaveArgs>) -> ToolResult {
+        self.run(Op::SaveDesign { file: a.file })
+    }
+
+    #[tool(description = "Set the plot: how far it reaches from the station origin on each side, in whole km (each axis 1 to 20 km in total).")]
+    fn set_plot(&self, Parameters(a): Parameters<PlotArgs>) -> ToolResult {
+        self.run(Op::SetPlot { pos: a.pos, neg: a.neg })
+    }
+
+    #[tool(description = "Fit the plot to the station: the smallest plot that holds it, or with grow_only just enlarge the current one. Fails if the station is longer than 20 km on an axis.")]
+    fn fit_plot(&self, Parameters(a): Parameters<FitPlotArgs>) -> ToolResult {
+        self.run(Op::FitPlot { grow_only: a.grow_only })
+    }
+
+    #[tool(description = "Move a module to a position in the build order (modules are built in index order). Refused if it would come before the module it attaches to, or after one attached to it. Modules are renumbered.")]
+    fn move_in_build_order(&self, Parameters(a): Parameters<MoveArgsOrder>) -> ToolResult {
+        self.run(Op::MoveInBuildOrder { index: a.index, position: a.position })
+    }
+
+    #[tool(description = "Build a module first: it becomes the root (the links from it to the old root are reversed, so that chain now hangs on it; nothing moves) and goes to the front, followed by that chain. Modules are renumbered.")]
+    fn build_first(&self, Parameters(a): Parameters<IndexArgs>) -> ToolResult {
+        self.run(Op::BuildFirst { index: a.index })
+    }
+
+    #[tool(description = "Build a module as late as possible: it and everything attached to it move to the end. Modules are renumbered.")]
+    fn build_last(&self, Parameters(a): Parameters<IndexArgs>) -> ToolResult {
+        self.run(Op::BuildLast { index: a.index })
+    }
+
+    #[tool(description = "Move a placed module, with everything attached to it, onto another free snap. Modules may be renumbered (the result has moved_to).")]
+    fn reattach_module(&self, Parameters(a): Parameters<ReattachArgs>) -> ToolResult {
+        self.run(Op::ReattachModule { index: a.index, to: a.to, to_snap: a.to_snap, snap: a.snap, twist: a.twist })
+    }
+
+    #[tool(description = "Make an attached module free-standing where it is (whatever is attached to it stays attached).")]
+    fn detach_module(&self, Parameters(a): Parameters<IndexArgs>) -> ToolResult {
+        self.run(Op::DetachModule { index: a.index })
+    }
+
+    #[tool(description = "Build materials: the resources (and estimated value at average prices) to build one module with its equipment, or the whole station. Also lists the build methods.")]
+    fn build_cost(&self, Parameters(a): Parameters<CostArgs>) -> ToolResult {
+        self.run(Op::BuildCost { index: a.index, method: a.method })
+    }
+
+    #[tool(description = "Station analysis: what the whole station produces and uses per hour (net per ware, largest surplus first), workforce needed vs housed (the work bonus scales with it; workers' food and medicine are included), storage per cargo type in hours, dock areas and piers, and notes on what is missing.")]
+    fn analyze_station(&self, Parameters(a): Parameters<AnalyzeArgs>) -> ToolResult {
+        self.run(Op::AnalyzeStation { sunlight: a.sunlight })
+    }
+
+    #[tool(description = "In-game load of the open station (what likely costs the game frame rate; players' rules of thumb, not measured): modules in total, connection structures among them (they make nothing), turrets and shields, dock areas plus piers, and size_km per axis.")]
+    fn station_load(&self) -> ToolResult {
+        self.run(Op::StationLoad)
+    }
+
+    #[tool(description = "Wares that some buildable station module makes: ware id and name (for plan_production targets).")]
+    fn list_wares(&self) -> ToolResult {
+        self.run(Op::ListWares)
+    }
+
+    #[tool(description = "Production planner: the modules to add to the open design to make the target wares. It adds the whole production chain, habitats for the workforce with their food and medicine, storage for N hours (or at least the m³ per type in storage), and a dock area and pier if missing; extra_modules (e.g. ship bays, defence platforms) are added too, role extra. Existing modules count as supply; with no targets it fixes the station's shortfalls. Returns the modules (macro, count, role), the station's analysis with them (raw materials stay short: they are mined or salvaged; self_sufficient says whether every made ware is covered) and the cost. It doesn't place anything: auto_place does.")]
+    fn plan_production(&self, Parameters(a): Parameters<ops::PlanArgs>) -> ToolResult {
+        self.run(Op::PlanProduction(a))
+    }
+
+    #[tool(description = "Auto-placement: attach modules to the open design at exact snap positions, clear of each other and inside the plot, adding connection structures (hubs, straight pieces) where needed; one undo step. Give modules (macro and count), or from_plan (plan_production settings) to plan and place in one call (the result then has the plan too). Big modules go first, dock areas, piers and bays last, where their exclusion zones (and for dock areas and piers a 3 km corridor out from the station) are clear, then defence platforms, spread over the station's extremities with a clear corridor (Administrative Centres have no turrets: they go first, at the centre); no module may block a placed one's zones or corridor. Modules already on the station stay where they are. Modules with sides (in modules, or in from_plan's extra_modules) go last, each on the outside of the station on its side with a clear lane out (nothing in front of it); sides_blocked counts those that found no such spot. Returns the new modules and connection structures (index, macro), what didn't fit, docks_blocked (docks, piers, defence platforms and bays: no clear space anywhere), sides_blocked, and the plot: with grow_plot (default true) the station may outgrow its plot, up to 20 km per axis; then tell the user and fit_plot with grow_only. fewer_connectors (default false) adds a hub only when it brings a module 4 km nearer the centre instead of 2 km: about half the connection structures, a larger station.")]
+    fn auto_place(&self, Parameters(a): Parameters<ops::AutoPlaceArgs>) -> ToolResult {
+        self.run(Op::AutoPlace(a))
+    }
+
+    #[tool(description = "Turrets and shields players can build: macro, name, kind, size, race, mark and average price.")]
+    fn list_equipment(&self, Parameters(a): Parameters<ListEquipmentArgs>) -> ToolResult {
+        self.run(Op::ListEquipment { kind: a.kind, size: a.size, race: a.race, search: a.search })
+    }
+
+    #[tool(description = "A placed module's equipment groups: for each group and kind (turrets, shields) the slot size and count, what is equipped, and the equipment macros that fit.")]
+    fn module_equipment(&self, Parameters(a): Parameters<IndexArgs>) -> ToolResult {
+        self.run(Op::ModuleEquipment { index: a.index })
+    }
+
+    #[tool(description = "Equip one kind of slot (turrets or shields) in a group of a module with a fitting macro (default: all its slots), or without macro remove it. Returns the module's groups.")]
+    fn set_equipment(&self, Parameters(a): Parameters<SetEquipmentArgs>) -> ToolResult {
+        self.run(Op::SetEquipment { index: a.index, group: a.group, kind: a.kind, r#macro: a.r#macro, count: a.count })
+    }
+
+    #[tool(description = "Equip many modules at once (one undo step): picks (equipment macros; each group takes, per kind, the first that fits all its slots) or a loadout level (none, low, medium, high). Default: every module with groups; modules or defence_only narrow it. Returns how many group slots were filled, cleared or skipped (nothing fitted).")]
+    fn equip_modules(&self, Parameters(a): Parameters<ops::EquipArgs>) -> ToolResult {
+        self.run(Op::EquipModules(a))
+    }
+
+    #[tool(description = "Optimize the open station (x4ep_planner's Optimise plus a re-layout), one undo step: adds the modules that fix its shortfalls (plan_production settings; targets ignored), then re-places its modules in layers: the Administrative Centre first, those that can't carry turrets or shields in the middle, defensible ones around them (with keep_shape false: packed into the smallest cube that holds them), dock areas, piers and bays outermost, defence platforms spread over the extremities, with their exclusion zones (and for dock areas, piers and defence platforms a 3 km corridor) clear. keep_shape (default true) keeps the connection structures and the modules carrying them; false rebuilds the connection structures. fewer_connectors (default false): fewer new connection structures, a larger station. modules: add exactly these instead of planning the fixes (e.g. plan_production with no targets, trimmed by the user). The plot is then fitted to the station. Equipment stays with each module type. If anything finds no place, nothing changes (error). Returns what was added and moved, connection structures removed/added, the plot and the analysis.")]
+    fn optimize_station(&self, Parameters(a): Parameters<ops::OptimizeArgs>) -> ToolResult {
+        self.run(Op::OptimizeStation(a))
+    }
+
+    #[tool(description = "Copy a module's equipment: scope same_type (default) gives every module of its type the same equipment; all uses its equipment macros as picks for every module.")]
+    fn copy_equipment(&self, Parameters(a): Parameters<CopyEquipmentArgs>) -> ToolResult {
+        self.run(Op::CopyEquipment { from: a.from, scope: a.scope })
+    }
+
+    #[tool(description = "End a build stage after this module (or remove that stage end). Stages let the station be built in steps.")]
+    fn set_stage_end(&self, Parameters(a): Parameters<StageArgs>) -> ToolResult {
+        self.run(Op::SetStageEnd { index: a.index, end: a.end })
+    }
+
+    #[tool(description = "Put the open design into the game: writes it to the player profile's constructionplan folder. The player then clicks Import in the station build menu. Import replaces the player's plan with the same id; a renamed plan becomes a new plan instead (new id, new_plan: true), so the original stays.")]
+    fn export_design(&self, Parameters(a): Parameters<ExportArgs>) -> ToolResult {
+        self.run(Op::ExportDesign { new_id: a.new_id, overwrite: a.overwrite })
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for Server {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("x4sd", env!("CARGO_PKG_VERSION")))
+            .with_instructions(INSTRUCTIONS)
+    }
+}
+
+impl Server {
+    /// Runs an operation in the builder if one is running, else on the own design.
+    fn run(&self, op: Op) -> ToolResult {
+        let mut state = self.state.lock().unwrap();
+        if state.link.is_none() {
+            state.link = Client::connect();
+        }
+        if let Some(link) = state.link.as_mut() {
+            return match link.send(&op) {
+                Ok(result) => result.map(|v| v.to_string()),
+                Err(e) => {
+                    state.link = None;
+                    Err(format!(
+                        "lost the connection to the builder ({e}); the operation may not have been applied. \
+                         Further calls use the builder again if it is reopened, otherwise a separate headless design."
+                    ))
+                }
+            };
+        }
+        if state.local.is_none() {
+            // Looked up again: the player may have picked the folder in the builder since.
+            let game = state
+                .game_dir
+                .clone()
+                .or_else(find_game_dir)
+                .ok_or("X4 install not found; start with --game-dir, set X4_GAME_DIR, or pick the folder once in the builder")?;
+            state.local = Some(ops::load(&game, state.profile_dir.as_deref()).map_err(|e| e.to_string())?);
+        }
+        let State { local: Some((catalog, names)), design, profile_dir, blueprints, .. } = &mut *state else { unreachable!() };
+        let mut ctx = Ctx { catalog, names, design, profile_dir: profile_dir.as_deref(), blueprints };
+        ops::execute(op, &mut ctx).map(|v| v.to_string())
+    }
+}
+
+pub fn serve(game_dir: Option<PathBuf>, profile_dir: Option<PathBuf>) -> x4sd_core::Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let service = Server::new(game_dir, profile_dir)
+            .serve(rmcp::transport::stdio())
+            .await
+            .map_err(|e| x4sd_core::Error(format!("MCP start failed: {e}")))?;
+        service.waiting().await.map_err(|e| x4sd_core::Error(format!("MCP server stopped: {e}")))?;
+        Ok(())
+    })
+}
