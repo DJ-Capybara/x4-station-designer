@@ -1,4 +1,12 @@
-<p align="center"><img src="crates/x4sd/icons/icon.png" width="112" alt="X4 Station Designer icon"></p>
+# https://github.com/Thiago-Dantas/x4-station-designer
+
+This is a linux port of Thiago-Dantas' excellent X4 station designer.
+
+The final binary expects a snap Steam installation.
+
+Install Cargo (nightly, otherwise it won't compile) & Node. Run build.sh.
+
+No support will be provided, also entirely vibed.
 
 # X4 Station Designer
 
