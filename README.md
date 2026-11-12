@@ -1,6 +1,7 @@
-# https://github.com/Thiago-Dantas/x4-station-designer
+# X4 station designer for Linux
 
-This is a linux port of Thiago-Dantas' excellent X4 station designer.
+This is a linux port of Thiago-Dantas' excellent X4 station designer:
+https://github.com/Thiago-Dantas/x4-station-designer
 
 The final binary expects a snap Steam installation.
 
